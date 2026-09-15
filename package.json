@@ -1,0 +1,16 @@
+{
+  "name": "l402-agent-demo",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:binaries": "scripts/build-binaries.sh",
+    "up": "scripts/up.sh",
+    "down": "scripts/down.sh",
+    "test": "bun test",
+    "smoke": "bun scripts/smoke.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "zod": "4.6.5"
+  }
+}

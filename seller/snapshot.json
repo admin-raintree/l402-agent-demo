@@ -1,0 +1,39 @@
+{
+  "as_of": "2026-09-15T18:22:19+00:00",
+  "source": "mempool.space snapshot",
+  "prices": {
+    "time": 1789496403,
+    "USD": 76599,
+    "EUR": 66373,
+    "GBP": 56877,
+    "CAD": 106612,
+    "CHF": 62793,
+    "AUD": 107374,
+    "JPY": 11885056
+  },
+  "hashrate": {
+    "currentHashrate": 982685111730926900000,
+    "currentDifficulty": 127450789715843.1
+  },
+  "rewards": {
+    "startBlock": 967031,
+    "endBlock": 967174,
+    "totalReward": "45226409182",
+    "totalFee": "226409182",
+    "totalTx": "737709"
+  },
+  "difficulty": {
+    "progressPercent": 74.90079365079364,
+    "difficultyChange": 5.88969064699465,
+    "estimatedRetargetDate": 1789783444012,
+    "remainingBlocks": 506,
+    "remainingTime": 286903012,
+    "previousRetarget": 1.3065347465004749,
+    "previousTime": 1788640367,
+    "nextRetargetHeight": 967680,
+    "timeAvg": 567002,
+    "adjustedTimeAvg": 567002,
+    "timeOffset": 0,
+    "expectedBlocks": 1426.9566666666667
+  }
+}

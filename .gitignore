@@ -1,0 +1,4 @@
+/node_modules
+/.bin/
+/.demo/
+.DS_Store

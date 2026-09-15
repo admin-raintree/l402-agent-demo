@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "l402-wallet": {
+      "command": "bun",
+      "args": ["agent/server.ts"],
+      "env": {
+        "L402_AUTO_APPROVE_SATS": "100",
+        "L402_DAILY_BUDGET_SATS": "5000"
+      }
+    }
+  }
+}

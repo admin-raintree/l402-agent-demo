@@ -82,7 +82,7 @@ assert.deepEqual(
 	wallet.recent_receipts.map((r: { outcome: string }) => r.outcome),
 	["paid", "refused", "declined", "paid", "refused"],
 );
-console.log(`  spent ${wallet.spent_today_sat} of ${wallet.policy.daily_budget_sats} sats; channel balance ${wallet.channel_balance_sat} sats`);
+console.log(`  spent ${wallet.spent_today_sat} of ${wallet.policy.daily_budget_sats} sats; ${wallet.wallet} balance ${wallet.balance_sat} sats`);
 
 await client.close();
 console.log("\nSmoke test passed.");

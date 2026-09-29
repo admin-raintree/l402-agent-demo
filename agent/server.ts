@@ -1,4 +1,4 @@
-// MCP server that gives an agent a Lightning wallet with a spending policy.
+// MCP server that gives an agent a Lightning wallet (lnd or Wavelength) with a spending policy.
 // It discovers L402 services, pays their challenges, reuses paid tokens, asks a
 // human (MCP elicitation) above a threshold, and keeps a receipt for every decision.
 import { createHash } from "node:crypto";
@@ -8,6 +8,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { decide, parseChallenge, type Receipt, spentToday } from "./policy";
+import { PaymentPending, walletFromEnv } from "./wallet";
 
 const ROOT = resolve(import.meta.dir, "..");
 const DEMO = resolve(ROOT, ".demo");
@@ -38,22 +39,15 @@ const readLedger = (): Receipt[] =>
 const record = (r: Receipt) => appendFileSync(LEDGER, `${JSON.stringify(r)}\n`, { mode: 0o600 });
 const json = (value: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }] });
 
-// The agent's node credential is a baked macaroon limited to reading and paying invoices.
-async function lncli(...args: string[]): Promise<string> {
-	const p = Bun.spawn(
-		[
-			resolve(ROOT, ".bin/lncli"),
-			"--network=regtest",
-			"--rpcserver=127.0.0.1:10019",
-			`--tlscertpath=${DEMO}/buyer/tls.cert`,
-			`--macaroonpath=${DEMO}/agent-pay.macaroon`,
-			...args,
-		],
-		{ stdout: "pipe", stderr: "pipe" },
-	);
-	const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
-	if (code !== 0) throw new Error(`lncli ${args[0]} failed: ${(err || out).trim()}`);
-	return out;
+const wallet = walletFromEnv(ROOT, DEMO);
+
+// One payment decision at a time: the budget check and the payment run under this lock, so
+// concurrent calls cannot both fit the same remaining budget.
+let lock: Promise<unknown> = Promise.resolve();
+function serialized<T>(fn: () => Promise<T>): Promise<T> {
+	const run = lock.then(fn, fn);
+	lock = run.catch(() => undefined);
+	return run;
 }
 
 async function discover(origin: string): Promise<Manifest> {
@@ -159,57 +153,75 @@ server.registerTool(
 		const challenge = parseChallenge(first.headers.get("www-authenticate"));
 		if (!challenge) return json({ status: 402, paid: false, error: "402 response without an L402 challenge" });
 
-		const invoice = JSON.parse(await lncli("decodepayreq", challenge.invoice));
-		const base = {
-			ts: new Date().toISOString(),
-			url: url.href,
-			service,
-			amount_sat: Math.ceil(Number(invoice.num_msat) / 1000),
-			fee_sat: 0,
-			payment_hash: invoice.payment_hash as string,
-		};
-		const stop = (outcome: "declined" | "refused", reason: string, approval: Receipt["approval"] = "none") => {
-			record({ ...base, approval, outcome, reason });
-			return json({ status: 402, paid: false, outcome, reason, price_sats: base.amount_sat });
-		};
+		const paid = await serialized(async () => {
+			const quote = await wallet.quote(challenge.invoice, FEE_LIMIT_SATS);
+			const base = {
+				ts: new Date().toISOString(),
+				url: url.href,
+				service,
+				wallet: wallet.name,
+				amount_sat: quote.amountSat,
+				fee_sat: 0,
+				payment_hash: quote.paymentHash,
+			};
+			const stop = (outcome: "declined" | "refused", reason: string, approval: Receipt["approval"] = "none") => {
+				record({ ...base, approval, outcome, reason });
+				return json({ status: 402, paid: false, outcome, reason, price_sats: base.amount_sat });
+			};
 
-		const expectedNode = manifests.get(url.origin)?.provider?.node_pubkey;
-		if (expectedNode && invoice.destination !== expectedNode)
-			return stop("refused", "invoice pays a different node than the provider's manifest names");
+			const expectedNode = manifests.get(url.origin)?.provider?.node_pubkey;
+			if (expectedNode && quote.destination && quote.destination !== expectedNode)
+				return stop("refused", "invoice pays a different node than the provider's manifest names");
 
-		// ponytail: check-then-pay isn't locked, so two concurrent calls could both fit the budget; reserve spend under a lock if agents run calls in parallel.
-		const spent = spentToday(readLedger());
-		const decision = decide(base.amount_sat, max_sats, spent, policy);
-		if (decision.kind === "refuse") return stop("refused", decision.reason);
-		if (decision.kind === "ask") {
-			const denied = await askHuman(
-				`Approve ${base.amount_sat} sats for ${method} ${url.pathname} (${service})? ` +
-					`${decision.reason}. Spent today: ${spent} of ${policy.dailyBudgetSats} sats.`,
-			);
-			if (denied) return stop("declined", denied, "human");
-		}
+			const spent = spentToday(readLedger());
+			const decision = decide(base.amount_sat, max_sats, spent, policy);
+			if (decision.kind === "refuse") return stop("refused", decision.reason);
+			if (decision.kind === "ask") {
+				const denied = await askHuman(
+					`Approve ${base.amount_sat} sats for ${method} ${url.pathname} (${service})? ` +
+						`${decision.reason}. Spent today: ${spent} of ${policy.dailyBudgetSats} sats.`,
+				);
+				if (denied) return stop("declined", denied, "human");
+			}
 
-		const out = await lncli("payinvoice", "--force", "--json", `--fee_limit=${FEE_LIMIT_SATS}`, challenge.invoice);
-		const status = [...out.matchAll(/"status":\s*"(\w+)"/g)].at(-1)?.[1];
-		const preimage = out.match(/"payment_preimage":\s*"([0-9a-f]{64})"/)?.[1];
-		if (status !== "SUCCEEDED" || !preimage) throw new Error(`payment did not succeed (status ${status ?? "unknown"})`);
-		if (createHash("sha256").update(Buffer.from(preimage, "hex")).digest("hex") !== base.payment_hash)
-			throw new Error("preimage does not match the invoice's payment hash");
-		const fee = Number([...out.matchAll(/"fee_sat":\s*"(\d+)"/g)].at(-1)?.[1] ?? 0);
-		const approval = decision.kind === "ask" ? "human" : "auto";
-		record({ ...base, fee_sat: fee, preimage, approval, outcome: "paid" });
-		tokens[key] = `L402 ${challenge.macaroon}:${preimage}`;
-		saveTokens();
+			const approval = decision.kind === "ask" ? "human" : "auto";
+			let result: Awaited<ReturnType<typeof wallet.pay>>;
+			try {
+				result = await wallet.pay(challenge.invoice, quote, FEE_LIMIT_SATS);
+			} catch (e) {
+				// An unsettled payment may still complete, so count it against the budget.
+				if (e instanceof PaymentPending) record({ ...base, approval, outcome: "paid", reason: e.message });
+				throw e;
+			}
+			const { preimage, feeSat } = result;
+			const verified =
+				preimage !== undefined &&
+				createHash("sha256").update(Buffer.from(preimage, "hex")).digest("hex") === base.payment_hash;
+			if (!verified) {
+				// The money left the wallet, so the receipt counts against the budget either way.
+				const reason = preimage
+					? "preimage does not match the invoice's payment hash"
+					: `payment settled${quote.rail ? ` on ${quote.rail}` : ""} without revealing a preimage, so there is no L402 proof of payment`;
+				record({ ...base, fee_sat: feeSat, preimage, approval, outcome: "paid", reason });
+				return json({ status: 402, paid: true, proof_of_payment: false, reason, payment_hash: base.payment_hash });
+			}
+			record({ ...base, fee_sat: feeSat, preimage, approval, outcome: "paid" });
+			tokens[key] = `L402 ${challenge.macaroon}:${preimage}`;
+			saveTokens();
+			return { ...base, fee_sat: feeSat, approval, spent };
+		});
+		if ("content" in paid) return paid;
 
 		const res = await call(tokens[key]);
 		return json({
 			status: res.status,
 			payment: {
-				amount_sat: base.amount_sat,
-				fee_sat: fee,
-				approval,
-				payment_hash: base.payment_hash,
-				spent_today_sat: spent + base.amount_sat + fee,
+				wallet: paid.wallet,
+				amount_sat: paid.amount_sat,
+				fee_sat: paid.fee_sat,
+				approval: paid.approval,
+				payment_hash: paid.payment_hash,
+				spent_today_sat: paid.spent + paid.amount_sat + paid.fee_sat,
 				daily_budget_sat: policy.dailyBudgetSats,
 			},
 			body: await readBody(res),
@@ -221,18 +233,18 @@ server.registerTool(
 	"l402_wallet",
 	{
 		title: "Wallet and spending",
-		description: "Show the spending policy, today's spend, remaining daily budget, channel balance, and recent receipts.",
+		description: "Show the wallet backend, spending policy, today's spend, remaining daily budget, balance, and recent receipts.",
 		annotations: { readOnlyHint: true },
 	},
 	async () => {
 		const ledger = readLedger();
 		const spent = spentToday(ledger);
-		const balance = JSON.parse(await lncli("channelbalance"));
 		return json({
 			policy: { auto_approve_sats: policy.autoApproveSats, daily_budget_sats: policy.dailyBudgetSats, fee_limit_sats: FEE_LIMIT_SATS },
 			spent_today_sat: spent,
 			remaining_today_sat: Math.max(0, policy.dailyBudgetSats - spent),
-			channel_balance_sat: Number(balance.local_balance?.sat ?? 0),
+			wallet: wallet.name,
+			balance_sat: await wallet.balanceSat(),
 			recent_receipts: ledger.slice(-8).map(({ preimage, ...r }) => r),
 		});
 	},

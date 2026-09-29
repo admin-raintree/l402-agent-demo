@@ -13,6 +13,7 @@ export type Receipt = {
 	preimage?: string;
 	approval: "auto" | "human" | "none";
 	outcome: "paid" | "declined" | "refused";
+	wallet?: "lnd" | "wavelength";
 	reason?: string;
 };
 

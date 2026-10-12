@@ -1,5 +1,6 @@
 {
   "name": "l402-agent-demo",
+  "license": "MIT",
   "private": true,
   "type": "module",
   "scripts": {

@@ -12,32 +12,35 @@ export type Receipt = {
 	payment_hash: string;
 	preimage?: string;
 	approval: "auto" | "human" | "none";
-	outcome: "paid" | "declined" | "refused";
+	outcome: "paid" | "pending" | "failed" | "declined" | "refused";
+	proof_of_payment?: boolean;
 	wallet?: "lnd" | "wavelength";
 	reason?: string;
 };
 
 export type Decision = { kind: "pay" } | { kind: "ask" | "refuse"; reason: string };
 
-/** Sats paid (amount plus routing fees) on the current UTC day. */
+/** Today's settled cost plus every unresolved reservation, including earlier days. */
 export function spentToday(ledger: Receipt[], now = new Date()): number {
 	const day = now.toISOString().slice(0, 10);
 	return ledger
-		.filter((r) => r.outcome === "paid" && r.ts.slice(0, 10) === day)
+		.filter((r) => r.outcome === "pending" || (r.outcome === "paid" && r.ts.slice(0, 10) === day))
 		.reduce((sum, r) => sum + r.amount_sat + r.fee_sat, 0);
 }
 
-export function decide(amountSats: number, maxSats: number, spent: number, policy: Policy): Decision {
+export function decide(amountSats: number, maxSats: number, spent: number, policy: Policy, feeLimitSats = 0): Decision {
+	if (![amountSats, maxSats, spent, policy.autoApproveSats, policy.dailyBudgetSats, feeLimitSats].every(n => Number.isSafeInteger(n) && n >= 0))
+		return { kind: "refuse", reason: "invalid spending policy, amount, or fee limit" };
 	if (!Number.isInteger(amountSats) || amountSats <= 0)
 		return { kind: "refuse", reason: "invoice has no fixed amount; refusing to pay an open-ended invoice" };
-	if (amountSats > maxSats) return { kind: "refuse", reason: `price ${amountSats} sats exceeds max_sats ${maxSats}` };
-	if (spent + amountSats > policy.dailyBudgetSats)
+	if (amountSats + feeLimitSats > maxSats) return { kind: "refuse", reason: `price plus maximum fees ${amountSats + feeLimitSats} sats exceeds max_sats ${maxSats}` };
+	if (spent + amountSats + feeLimitSats > policy.dailyBudgetSats)
 		return {
 			kind: "refuse",
-			reason: `would exceed the daily budget: ${spent} of ${policy.dailyBudgetSats} sats already spent today`,
+			reason: `would exceed the daily budget: ${spent} of ${policy.dailyBudgetSats} sats already charged or reserved`,
 		};
-	if (amountSats > policy.autoApproveSats)
-		return { kind: "ask", reason: `price ${amountSats} sats is above the ${policy.autoApproveSats}-sat auto-approve limit` };
+	if (amountSats + feeLimitSats > policy.autoApproveSats)
+		return { kind: "ask", reason: `price plus maximum fees ${amountSats + feeLimitSats} sats is above the ${policy.autoApproveSats}-sat auto-approve limit` };
 	return { kind: "pay" };
 }
 

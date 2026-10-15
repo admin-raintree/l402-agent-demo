@@ -21,7 +21,7 @@ const fake = Bun.serve({
 		if (path === "list") {
 			listCalls++;
 			// First poll: still pending. Afterwards: whatever the test set.
-			return Response.json({ entries: [listCalls === 1 ? { id: hash, status: "ENTRY_STATUS_PENDING" } : entry] });
+			return Response.json({ activity: { entries: [listCalls === 1 ? { id: hash, status: "ENTRY_STATUS_PENDING" } : entry] } });
 		}
 		if (path === "balance") return Response.json({ confirmed_sat: "250000" });
 		return new Response("not found", { status: 404 });
@@ -59,11 +59,35 @@ test("reports a settled payment with no preimage instead of inventing proof", as
 test("surfaces a failed payment", async () => {
 	reset({ id: hash, status: "ENTRY_STATUS_FAILED", failure_reason: "no route" });
 	const w = wallet();
-	await expect(w.pay("x", await w.quote("x", 10), 10)).rejects.toThrow("payment failed: no route");
+	await expect(w.pay("x", await w.quote("x", 10), 10)).rejects.toThrow("payment failed: wallet confirmed terminal failure");
 });
 
 test("times out as PaymentPending so the caller can count the sats as possibly spent", async () => {
 	reset({ id: hash, status: "ENTRY_STATUS_PENDING" });
 	const w = wallet(30);
 	await expect(w.pay("x", await w.quote("x", 10), 10)).rejects.toBeInstanceOf(PaymentPending);
+});
+
+test("reconciliation follows activity cursors instead of treating page one as complete", async () => {
+	const pages: string[] = [];
+	const gateway = Bun.serve({ port: 0, async fetch(req) {
+		const { cursor } = await req.json() as { cursor: string };
+		pages.push(cursor);
+		return Response.json({ activity: cursor === "older"
+			? { entries: [{ id: hash, status: "ENTRY_STATUS_COMPLETE", fee_sat: "2", progress: { preimage } }] }
+			: { entries: [], has_more: true, next_cursor: "older" } });
+	} });
+	try {
+		const w = wavelengthWallet({ url: gateway.url.toString().replace(/\/$/, "") });
+		expect(await w.lookup({ paymentHash: hash, amountSat: 1000 })).toEqual({ state: "paid", result: { feeSat: 2, preimage } });
+		expect(pages).toEqual(["", "older"]);
+	} finally { gateway.stop(true); }
+});
+
+test("malformed or repeated activity cursors fail closed", async () => {
+	const gateway = Bun.serve({ port: 0, fetch: () => Response.json({ activity: { entries: [], has_more: true, next_cursor: "same" } }) });
+	try {
+		const w = wavelengthWallet({ url: gateway.url.toString().replace(/\/$/, "") });
+		await expect(w.lookup({ paymentHash: hash, amountSat: 1000 })).rejects.toThrow("invalid Wavelength activity cursor");
+	} finally { gateway.stop(true); }
 });

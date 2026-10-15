@@ -1,5 +1,4 @@
-// Wallet backends. The policy layer needs three things from a wallet: read an invoice
-// before paying it, pay it and get the preimage back, and report a balance.
+// Wallet backends decode invoices, send payments, reconcile outcomes, and report balances.
 //   lnd:        shells out to lncli with a baked pay-only macaroon.
 //   wavelength: calls a Wavelength (waved) daemon's wallet REST API, so the agent pays
 //               from a self-custodial Ark wallet without running a Lightning node.
@@ -22,11 +21,15 @@ export type Paid = { feeSat: number; preimage?: string };
 /** Thrown when a payment was sent but has not settled or failed yet; its sats may still leave the wallet. */
 export class PaymentPending extends Error {}
 
+export class PaymentFailed extends Error {}
+export type PaymentStatus = { state: "pending" | "unknown" | "failed" } | { state: "paid"; result: Paid };
+
 export type Wallet = {
 	name: "lnd" | "wavelength";
 	quote(invoice: string, feeLimitSat: number): Promise<Quote>;
 	pay(invoice: string, quote: Quote, feeLimitSat: number): Promise<Paid>;
 	balanceSat(): Promise<number>;
+	lookup(quote: Quote): Promise<PaymentStatus>;
 };
 
 export function lndWallet(root: string, demo: string): Wallet {
@@ -58,6 +61,20 @@ export function lndWallet(root: string, demo: string): Wallet {
 			const preimage = out.match(/"payment_preimage":\s*"([0-9a-f]{64})"/)?.[1];
 			if (status !== "SUCCEEDED" || !preimage) throw new Error(`payment did not succeed (status ${status ?? "unknown"})`);
 			return { preimage, feeSat: Number([...out.matchAll(/"fee_sat":\s*"(\d+)"/g)].at(-1)?.[1] ?? 0) };
+		},
+		async lookup(quote) {
+			let offset = "0";
+			for (;;) {
+				const page = JSON.parse(await lncli("listpayments", "--include_incomplete", "--paginate_forwards", "--max_payments=100", `--index_offset=${offset}`));
+				const p = (page.payments ?? []).find((p: { payment_hash: string }) => p.payment_hash === quote.paymentHash);
+				if (p?.status === "SUCCEEDED") return { state: "paid", result: { feeSat: Number(p.fee_sat), preimage: p.payment_preimage } };
+				if (p?.status === "FAILED") return { state: "failed" };
+				if (p) return { state: "pending" };
+				if (!page.payments?.length) return { state: "unknown" };
+				const next = String(page.last_index_offset);
+				if (!/^\d+$/.test(next) || BigInt(next) <= BigInt(offset)) throw new Error("invalid lnd payment pagination");
+				offset = next;
+			}
 		},
 		async balanceSat() {
 			return Number(JSON.parse(await lncli("channelbalance")).local_balance?.sat ?? 0);
@@ -102,8 +119,28 @@ export function wavelengthWallet(o: WavelengthOptions): Wallet {
 		return JSON.parse(text) as T;
 	}
 
+	async function lookup(quote: Quote): Promise<PaymentStatus> {
+		let cursor = "";
+		const visited = new Set<string>();
+		for (;;) {
+			const page = await rpc<{ activity?: { entries?: Entry[]; has_more?: boolean; next_cursor?: string } }>("list", {
+				view: "LIST_VIEW_ACTIVITY", kinds: ["ENTRY_KIND_SEND"], limit: 50, cursor,
+			});
+			if (!page.activity) throw new Error("Wavelength response has no activity view");
+			const e = (page.activity.entries ?? []).find(x => x.id === quote.paymentHash || x.progress?.payment_hash === quote.paymentHash);
+			if (e?.status === "ENTRY_STATUS_FAILED") return { state: "failed" };
+			if (e?.status === "ENTRY_STATUS_COMPLETE") return { state: "paid", result: { feeSat: Number(e.fee_sat ?? 0), preimage: e.progress?.preimage || undefined } };
+			if (e) return { state: "pending" };
+			if (!page.activity.has_more) return { state: "unknown" };
+			cursor = page.activity.next_cursor ?? "";
+			if (!cursor || visited.has(cursor)) throw new Error("invalid Wavelength activity cursor");
+			visited.add(cursor);
+		}
+	}
+
 	return {
 		name: "wavelength",
+		lookup,
 		async quote(invoice, feeLimitSat) {
 			// PrepareSend validates the invoice and previews the payment without moving funds.
 			const p = await rpc<{
@@ -112,6 +149,8 @@ export function wavelengthWallet(o: WavelengthOptions): Wallet {
 				payment_hash: string;
 				rail: string;
 			}>("prepare-send", { invoice, max_fee_sat: feeLimitSat });
+			if (p.rail !== "SEND_RAIL_LIGHTNING") throw new Error("L402 requires a confirmed Lightning settlement rail");
+			if (!p.send_intent_id) throw new Error("Wavelength returned no send intent");
 			return { amountSat: Number(p.amount_sat), paymentHash: p.payment_hash, rail: p.rail, intentId: p.send_intent_id };
 		},
 		async pay(_invoice, quote) {
@@ -122,15 +161,9 @@ export function wavelengthWallet(o: WavelengthOptions): Wallet {
 			// id, and the preimage appears on the entry once the swap reveals it.
 			const deadline = Date.now() + timeoutMs;
 			for (;;) {
-				const { entries = [] } = await rpc<{ entries?: Entry[] }>("list", {
-					view: "LIST_VIEW_ACTIVITY",
-					kinds: ["ENTRY_KIND_SEND"],
-					limit: 50,
-				});
-				const e = entries.find((x) => x.id === quote.paymentHash || x.progress?.payment_hash === quote.paymentHash);
-				if (e?.status === "ENTRY_STATUS_FAILED") throw new Error(`payment failed: ${e.failure_reason || "no reason given"}`);
-				if (e?.status === "ENTRY_STATUS_COMPLETE")
-					return { feeSat: Number(e.fee_sat ?? 0), preimage: e.progress?.preimage || undefined };
+				const status = await lookup(quote);
+				if (status.state === "failed") throw new PaymentFailed("payment failed: wallet confirmed terminal failure");
+				if (status.state === "paid") return status.result;
 				if (Date.now() > deadline)
 					throw new PaymentPending(`payment still pending after ${timeoutMs / 1000}s; check the Wavelength wallet before retrying`);
 				await Bun.sleep(pollMs);

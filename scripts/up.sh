@@ -75,6 +75,7 @@ sleep 1
 mine 6 >/dev/null
 channel_active() { buyer listchannels --active_only | grep -q '"active": true'; }
 wait_for "channel to open" channel_active
+wait_for "payment route" buyer queryroutes --dest="$SELLER_PUBKEY" --amt=1000 --fee_limit=10
 
 # Least privilege: the agent's MCP server gets a macaroon that can read and pay invoices, nothing else.
 buyer bakemacaroon offchain:read offchain:write info:read --save_to="$D/agent-pay.macaroon" >/dev/null

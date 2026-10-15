@@ -14,6 +14,35 @@ Verified with real regtest payments through [Aperture](https://github.com/lightn
 
 The sample service sells mining economics from [mempool.space](https://mempool.space): `hashprice` for 10 sats, `breakeven` for 50 sats, and `report` for 1,000 sats.
 
+## How it works
+
+```mermaid
+sequenceDiagram
+    participant H as Person
+    participant A as Claude Code
+    participant W as l402-wallet MCP server
+    participant P as Aperture (L402 proxy)
+    participant S as Mining data service
+    participant N as Agent wallet (lnd or Wavelength)
+
+    A->>W: l402_discover(url)
+    W->>P: GET /.well-known/l402.json (free)
+    A->>W: l402_fetch(url, max_sats)
+    W->>P: GET /v1/report
+    P-->>W: 402 + macaroon + invoice
+    W->>N: decode or prepare the invoice
+    Note over W: Check the policy: cap, daily budget, auto-approve limit, provider node
+    W->>H: Elicitation: approve 1000 sats + up to 10 sats in fees?
+    H-->>W: approve
+    Note over W: Reserve invoice amount plus maximum fees
+    W->>N: pay
+    N-->>W: preimage
+    Note over W: Verify proof and save settlement atomically
+    W->>P: GET /v1/report, Authorization: L402 macaroon:preimage
+    P->>S: proxied request
+    S-->>A: report JSON
+```
+
 ## Run it
 
 Requires Go 1.26+ and Bun; verified with Bun 1.4.2. **`up` resets `.demo`**, so preserve any existing demo state first. Run these commands in one terminal session:

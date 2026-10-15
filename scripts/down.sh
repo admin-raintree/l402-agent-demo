@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Stop every process started by up.sh and wait for it to exit, so ports are free for the next run.
-D="$(cd "$(dirname "$0")/.." && pwd)/.demo"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+D="${L402_DEMO_DIR:-$ROOT/.demo}"
 pids=()
 for f in "$D"/*.pid; do
   [ -f "$f" ] || continue

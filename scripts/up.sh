@@ -4,11 +4,15 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/.bin"
-D="$ROOT/.demo"
+D="${L402_DEMO_DIR:-$ROOT/.demo}"
+export L402_DEMO_DIR="$D"
 export PATH="$BIN:$PATH"
 
-"$ROOT/scripts/down.sh" >/dev/null 2>&1 || true
-rm -rf "$D" && mkdir -p "$D/logs"
+if [ -d "$D" ] && [ -n "$(ls -A "$D")" ]; then
+  echo "Refusing to overwrite existing state: $D. Set L402_DEMO_DIR to a new empty directory." >&2
+  exit 1
+fi
+mkdir -p "$D/logs"
 # On any failure, stop whatever already started (logs stay in .demo/logs).
 trap 'status=$?; [ $status -ne 0 ] && "$ROOT/scripts/down.sh" >/dev/null; exit $status' EXIT
 
@@ -25,9 +29,10 @@ btcd_start() {
     -C "$D/btcd/btcd.conf" -b "$D/btcd/data" --logdir="$D/btcd/logs" \
     --rpccert="$D/btcd/rpc.cert" --rpckey="$D/btcd/rpc.key" "$@" >"$D/logs/btcd.log" 2>&1 &
   echo $! >"$D/btcd.pid"
-  wait_for btcd btcctl -C "$D/btcd/btcd.conf" --regtest "${RPC[@]}" --rpcserver=127.0.0.1:18556 --rpccert="$D/btcd/rpc.cert" getblockcount
+  wait_for btcd ctl getblockcount
 }
-mine() { btcctl -C "$D/btcd/btcd.conf" --regtest "${RPC[@]}" --rpcserver=127.0.0.1:18556 --rpccert="$D/btcd/rpc.cert" generate "$1"; }
+ctl() { btcctl -C "$D/btcd/btcd.conf" --regtest "${RPC[@]}" --rpcserver=127.0.0.1:18556 --rpccert="$D/btcd/rpc.cert" "$@"; }
+mine() { ctl generate "$1"; }
 
 # name rpc-port p2p-port
 lnd_start() {

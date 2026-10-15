@@ -10,9 +10,10 @@ import { PaymentFailed, walletFromEnv } from "./wallet";
 import { Store, type Purchase } from "./store";
 
 const ROOT = resolve(import.meta.dir, "..");
-const DEMO = resolve(ROOT, ".demo");
+const DEMO = process.env.L402_DEMO_DIR ?? resolve(ROOT, ".demo");
 const STATE = process.env.L402_STATE_DIR ?? resolve(DEMO, "agent");
 const FEE_LIMIT_SATS = 10;
+const taskId = process.env.L402_TASK_ID;
 const policy = {
 	autoApproveSats: Number(process.env.L402_AUTO_APPROVE_SATS ?? 100),
 	dailyBudgetSats: Number(process.env.L402_DAILY_BUDGET_SATS ?? 5000),
@@ -21,14 +22,14 @@ if (![policy.autoApproveSats, policy.dailyBudgetSats].every(n => Number.isSafeIn
 	throw new Error("spending limits must be nonnegative safe integers");
 const store = new Store(STATE);
 
-type Manifest = {
-	provider?: { name?: string; node_pubkey?: string };
-	services: {
-		name: string;
-		description?: string;
-		resources: { path?: string; method?: string; pricing: { model: string; price_msat?: number } }[];
-	}[];
-};
+const manifestSchema = z.object({
+	provider: z.object({ name: z.string().max(200).optional(), node_pubkey: z.string().regex(/^[0-9a-f]{66}$/i).optional() }).optional(),
+	services: z.array(z.object({ name: z.string().min(1).max(200), description: z.string().max(2000).optional(),
+		resources: z.array(z.object({ path: z.string().startsWith("/").max(1000), method: z.string().optional(),
+			pricing: z.object({ model: z.string(), price_msat: z.number().int().nonnegative().safe().optional() }) })).max(100)
+	})).max(100),
+});
+type Manifest = z.infer<typeof manifestSchema>;
 const manifests = new Map<string, Manifest>();
 const json = (value: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }] });
 
@@ -60,9 +61,9 @@ function serialized<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 async function discover(origin: string): Promise<Manifest> {
-	const res = await fetch(`${origin}/.well-known/l402.json`, { signal: AbortSignal.timeout(5000) });
+	const res = await fetch(`${origin}/.well-known/l402.json`, { signal: AbortSignal.timeout(5000), redirect: "error" });
 	if (!res.ok) throw new Error(`no L402 manifest at ${origin} (HTTP ${res.status})`);
-	const manifest = (await res.json()) as Manifest;
+	const manifest = manifestSchema.parse(await readBody(res));
 	manifests.set(origin, manifest);
 	return manifest;
 }
@@ -70,10 +71,23 @@ async function discover(origin: string): Promise<Manifest> {
 const serviceFor = (url: URL) =>
 	manifests
 		.get(url.origin)
-		?.services.find((s) => s.resources.some((r) => r.path && url.pathname.startsWith(r.path)))?.name ?? url.pathname;
+		?.services.find((s) => s.resources.some((r) => url.pathname === r.path || url.pathname.startsWith(r.path + "/")))?.name ?? url.pathname;
 
 async function readBody(res: Response): Promise<unknown> {
-	const text = (await res.text()).slice(0, 8000);
+	const reader = res.body?.getReader();
+	if (!reader) return "";
+	const chunks: Uint8Array[] = [];
+	let size = 0;
+	try {
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			size += value.length;
+			if (size > 64 * 1024) throw new Error("Provider response exceeds 64 KiB");
+			chunks.push(value);
+		}
+	} finally { await reader.cancel(); }
+	const text = Buffer.concat(chunks).toString("utf8");
 	try {
 		return JSON.parse(text);
 	} catch {
@@ -93,7 +107,7 @@ async function askHuman(message: string): Promise<string | undefined> {
 			properties: { approve: { type: "boolean", title: "Approve this payment", default: false } },
 			required: ["approve"],
 		},
-	});
+	}, { timeout: 150_000 });
 	if (r.action === "accept" && r.content?.approve === true) return undefined;
 	return { accept: "the human declined the payment", decline: "the human declined the payment", cancel: "the human dismissed the approval request" }[r.action];
 }
@@ -116,7 +130,7 @@ server.registerTool(
 				s.resources.map((r) => ({
 					service: s.name,
 					method: r.method ?? "GET",
-					url: `${origin}${r.path ?? ""}`,
+					url: `${origin}${r.path}`,
 					price_sats: r.pricing.model === "fixed" ? (r.pricing.price_msat ?? 0) / 1000 : r.pricing.model,
 					description: s.description,
 				})),
@@ -143,6 +157,7 @@ server.registerTool(
 	},
 	async ({ url: href, max_sats, method, body }) => serialized(async () => {
 		const url = new URL(href);
+		if (taskId) store.checkTask(taskId, url.href);
 		if (!["https:", "http:"].includes(url.protocol) || url.username || url.password) throw new Error("invalid provider URL");
 		if (!manifests.has(url.origin)) await discover(url.origin).catch(() => undefined);
 		const service = serviceFor(url);
@@ -162,7 +177,7 @@ server.registerTool(
 			}
 		};
 		const token = store.token(key);
-		if (token) return deliver(token, { amount_sat: 0, reused_paid_token: true });
+		if (token) return deliver(token, { amount_sat: 0, reused_paid_token: true, payment_hash: store.forKey(key)?.payment_hash });
 		const existing = store.forKey(key);
 		if (existing) return paymentState(existing);
 
@@ -172,7 +187,7 @@ server.registerTool(
 		if (!challenge) return json({ status: 402, paid: false, error: "402 response without an L402 challenge" });
 		const quote = await wallet.quote(challenge.invoice, FEE_LIMIT_SATS);
 		if (!/^[0-9a-f]{64}$/.test(quote.paymentHash)) throw new Error("wallet returned an invalid payment hash");
-		const base = { ts: new Date().toISOString(), url: url.href, service, wallet: wallet.name,
+		const base = { task_id: taskId, ts: new Date().toISOString(), url: url.href, service, wallet: wallet.name,
 			amount_sat: quote.amountSat, fee_sat: 0, payment_hash: quote.paymentHash };
 		const stop = (outcome: "declined" | "refused", reason: string, approval: Receipt["approval"] = "none") => {
 			store.record({ ...base, approval, outcome, reason });
@@ -182,13 +197,17 @@ server.registerTool(
 		if (expectedNode && quote.destination && quote.destination !== expectedNode)
 			return stop("refused", "invoice pays a different node than the provider's manifest names");
 		const spent = spentToday(store.ledger());
-		const decision = decide(base.amount_sat, max_sats, spent, policy, FEE_LIMIT_SATS);
+		let task;
+		try { if (taskId) task = store.checkTask(taskId, url.href, base.amount_sat, FEE_LIMIT_SATS); }
+		catch (e) { return stop("refused", e instanceof Error ? e.message : "Task refused purchase"); }
+		const decision = decide(base.amount_sat, max_sats, spent,
+			{ ...policy, autoApproveSats: Math.min(policy.autoApproveSats, task?.autoApproveSat ?? Infinity) }, FEE_LIMIT_SATS);
 		if (decision.kind === "refuse") return stop("refused", decision.reason);
 		if (decision.kind === "ask") {
 			let denied: string | undefined;
 			try {
 				denied = await askHuman(`Approve ${base.amount_sat} sats plus up to ${FEE_LIMIT_SATS} sats in fees for ${method} ${url.href} (${service})? ` +
-					`Remaining daily allowance: ${Math.max(0, policy.dailyBudgetSats - spent)} sats. ${decision.reason}.`);
+					`Payment: ${quote.paymentHash}. Remaining daily allowance: ${Math.max(0, policy.dailyBudgetSats - spent)} sats. ${decision.reason}.`);
 			} catch { denied = "approval unavailable or disconnected"; }
 			if (denied) return stop("declined", denied, "human");
 		}

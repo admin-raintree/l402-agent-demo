@@ -2,15 +2,16 @@
 // as a client would, scripting the human's approval answers, and asserts each policy path.
 import { strict as assert } from "node:assert";
 import { createHash } from "node:crypto";
-import { lndWallet } from "../agent/wallet";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { lndWallet } from "../agent/wallet";
 
 const ROOT = resolve(import.meta.dir, "..");
+const DEMO = process.env.L402_DEMO_DIR ?? resolve(ROOT, ".demo");
 const API = "http://127.0.0.1:8700";
 const answers: boolean[] = [false, true]; // first approval request: decline; second: approve
 
@@ -87,7 +88,7 @@ assert.deepEqual(
 console.log(`  spent ${wallet.spent_today_sat} of ${wallet.policy.daily_budget_sats} sats; ${wallet.wallet} balance ${wallet.balance_sat} sats`);
 
 step("9. Reconcile receipts with independent buyer and seller records");
-const backend = lndWallet(ROOT, resolve(ROOT, ".demo"));
+const backend = lndWallet(ROOT, DEMO);
 for (const payment of [hp.payment, report.payment]) {
 	const status = await backend.lookup({ paymentHash: payment.payment_hash, amountSat: payment.amount_sat });
 	assert.equal(status.state, "paid");
@@ -95,7 +96,7 @@ for (const payment of [hp.payment, report.payment]) {
 	assert.equal(status.result.feeSat, payment.fee_sat);
 	assert(status.result.preimage);
 	assert.equal(createHash("sha256").update(Buffer.from(status.result.preimage, "hex")).digest("hex"), payment.payment_hash);
-	const lookup = Bun.spawn([resolve(ROOT, ".bin/lncli"), `--lnddir=${resolve(ROOT, ".demo/seller")}`,
+	const lookup = Bun.spawn([resolve(ROOT, ".bin/lncli"), `--lnddir=${resolve(DEMO, "seller")}`,
 		"--network=regtest", "--rpcserver=127.0.0.1:10020", "lookupinvoice", payment.payment_hash], { stdout: "pipe", stderr: "pipe" });
 	const invoice = JSON.parse(await new Response(lookup.stdout).text());
 	assert.equal(await lookup.exited, 0);

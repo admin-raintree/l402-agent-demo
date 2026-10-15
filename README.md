@@ -1,102 +1,62 @@
-# L402 agent wallet with a spending policy
+# Controlled L402 resource viewer
 
-An MCP server that lets an AI agent buy L402 services within human-controlled spending limits. It supports lnd and [Wavelength](https://github.com/lightninglabs/wavelength), with durable payment reservations and recovery after crashes.
+Choose a resource, set a spending limit, approve or decline its Lightning invoice, and inspect the response and receipt. The dashboard uses an MCP wallet server and SQLite accounting to track authorization, payment, and delivery.
 
-Verified with real regtest payments through [Aperture](https://github.com/lightninglabs/aperture) v0.5.0 and lnd v0.21.3-beta. Built by Zachary Roth for Lightning Labs.
+[Run the demo](#start-the-local-demo) · [Full walkthrough](docs/README.md) · [Configuration](docs/reference.md) · [Verification results](VERIFICATION.md)
 
-## What it does
+## How a purchase works
 
-- Discovers services and prices through `/.well-known/l402.json`.
-- Automatically approves up to 100 sats, asks a person above that, and enforces per-call and daily limits. All limits include maximum fees.
-- Reserves the invoice amount plus 10 sats before sending. SQLite prevents competing processes from spending the same shared allowance.
-- Verifies payment preimages, reuses credentials, and reconciles uncertain payments without sending again.
-- Reports payment, proof, and resource delivery separately through MCP. Claude Code configuration is included in `.mcp.json`.
+This illustrated purchase costs 20 sats plus a 3-sat actual fee, with a 10-sat maximum fee authorized before payment. No funds move in the animations.
 
-The sample service sells mining economics from [mempool.space](https://mempool.space): `hashprice` for 10 sats, `breakeven` for 50 sats, and `report` for 1,000 sats.
+### 1. Request a resource
 
-## How it works
+Choose a resource and spending limits; the server obtains a payment quote before spending anything.
 
-```mermaid
-sequenceDiagram
-    participant H as Person
-    participant A as Claude Code
-    participant W as l402-wallet MCP server
-    participant P as Aperture (L402 proxy)
-    participant S as Mining data service
-    participant N as Agent wallet (lnd or Wavelength)
+![Request animation: the server requests a resource and receives an HTTP 402 payment challenge.](docs/assets/payment-request.gif)
 
-    A->>W: l402_discover(url)
-    W->>P: GET /.well-known/l402.json (free)
-    A->>W: l402_fetch(url, max_sats)
-    W->>P: GET /v1/report
-    P-->>W: 402 + macaroon + invoice
-    W->>N: decode or prepare the invoice
-    Note over W: Check the policy: cap, daily budget, auto-approve limit, provider node
-    W->>H: Elicitation: approve 1000 sats + up to 10 sats in fees?
-    H-->>W: approve
-    Note over W: Reserve invoice amount plus maximum fees
-    W->>N: pay
-    N-->>W: preimage
-    Note over W: Verify proof and save settlement atomically
-    W->>P: GET /v1/report, Authorization: L402 macaroon:preimage
-    P->>S: proxied request
-    S-->>A: report JSON
-```
+### 2. Approve the maximum cost
 
-## Run it
+With automatic approval at zero, review and approve up to 30 sats, including the maximum fee.
 
-Requires Go 1.26+ and Bun; verified with Bun 1.4.2. **`up` resets `.demo`**, so preserve any existing demo state first. Run these commands in one terminal session:
+![Approval animation: the policy asks a human to approve a maximum of 30 sats.](docs/assets/payment-approval.gif)
 
-```bash
+### 3. Reserve, pay, and verify
+
+Reserve 30 sats before sending, then record the actual 23-sat charge and verified credential after settlement.
+
+![Payment animation: a 30-sat reservation becomes a 23-sat settled charge.](docs/assets/payment-settlement.gif)
+
+### 4. Inspect and reuse
+
+Inspect the response and receipt; later requests can reuse the credential without another payment.
+
+![Response animation: the paid credential unlocks a resource response.](docs/assets/payment-response.gif)
+
+Follow the [12-step walkthrough](docs/README.md) for the implementation, recovery paths, and still-image alternatives. Each overview clip plays once for five seconds and may finish before you scroll to it.
+
+## Start the local demo
+
+Requires Bun and Go 1.26+ to build the pinned binaries. Existing source checkouts must be clean and at their pinned tags.
+
+```sh
 bun install --frozen-lockfile
-bun run build:binaries
-bun run up
-bun run smoke
-bun run down
+bun run build:binaries  # Skip if the pinned binaries are already installed.
+bun run demo
 ```
 
-`bun test` runs 35 tests, including 10,000 seeded accounting sequences, crash recovery, and scripted MCP clients. It needs no external network. The smoke test checks real payments against buyer history and seller invoices.
+Open **http://127.0.0.1:8787**. The demo uses an isolated Bitcoin regtest network and test coins.
 
-Set `L402_AUTO_APPROVE_SATS` (default `100`) and `L402_DAILY_BUDGET_SATS` (default `5000`) in `.mcp.json`. Pass `max_sats` to `l402_fetch` to cap each purchase, including maximum fees.
+1. Enter `/v1/hashprice`, set a budget, and leave auto-approval at zero to review payment.
+2. Select **Create request**, then **Start request**.
+3. Approve or decline the payment, then inspect the response and receipt.
 
-## Use Wavelength
+Ctrl-C stops the network. State and logs remain in the printed temporary directory. See [demo behavior and fixture prices](docs/reference.md#local-demo-behavior) for details.
 
-Live Wavelength settlement remains unverified. Build `waved` with `make install-wavewalletrpc`, enable `rpc.gateway.enabled=true`, and create a restricted macaroon:
+This is a trusted local application. Payment does not guarantee delivery or useful content; see [payment boundaries](docs/reference.md#payment-controls-and-boundaries).
 
-```bash
-wavecli bakemacaroon \
-  uri:/wavewalletrpc.WalletService/PrepareSend \
-  uri:/wavewalletrpc.WalletService/Send \
-  uri:/wavewalletrpc.WalletService/List \
-  uri:/wavewalletrpc.WalletService/Balance \
-  --save-to agent-pay.macaroon
-```
+## Documentation
 
-Add these variables to the MCP server's `env`:
-
-```json
-{
-  "L402_WALLET": "wavelength",
-  "WAVELENGTH_URL": "https://localhost:10031",
-  "WAVELENGTH_MACAROON_PATH": "/path/to/agent-pay.macaroon",
-  "WAVELENGTH_TLS_CERT": "/path/to/waved/tls.cert"
-}
-```
-
-The client requires `SEND_RAIL_LIGHTNING`; same-Ark and unknown rails are refused. Tests follow the wallet API at commit `2c4f1ee`, including paginated `activity.entries`.
-
-## State and recovery
-
-State lives in `L402_STATE_DIR` (default `.demo/agent`). Stop older servers before upgrading. Existing `receipts.jsonl` and `tokens.json` are imported once into `payments.sqlite` and left unchanged. New receipts are available through `l402_wallet`; JSONL is no longer updated. Stop all servers before backing up the state directory, including SQLite sidecar files.
-
-Confirmed failures release reservations. Confirmed settlements record actual fees and verified credentials atomically. Unknown payments remain reserved across restarts and UTC midnight, potentially indefinitely. Legacy pending receipts need operator investigation because they lack the original challenge.
-
-## Limits
-
-- The lnd backend is regtest-only. Wavelength signet settlement, fee enforcement, and litd allowances still need live verification.
-- Processes must share one local state directory, wallet, and policy to share a budget.
-- Wallet credentials are restricted, and state storage is owner-only. The lnd backend checks the payee against the manifest when supplied; Wavelength exposes no payee for that check.
-- Invalid proof or a rejected credential blocks automatic repurchase. Token expiry caveats are not interpreted. HTTP retries do not guarantee exactly-once POST execution.
-- Payment does not guarantee delivery or a refund. MPP challenges and quote endpoints are unsupported.
-
-See [verification results and remaining live checks](VERIFICATION.md) for evidence, pinned versions, and signet and litd prerequisites.
+- [Animated walkthrough](docs/README.md): all 12 steps, accounting, and recovery paths.
+- [Configuration and operations](docs/reference.md): existing networks, wallet setup, MCP tools, and stored state.
+- [Run the checks](docs/reference.md#verify): unit, browser, and local Lightning checks.
+- [Verification results and limitations](VERIFICATION.md): observed results and unverified behavior.

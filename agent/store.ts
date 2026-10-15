@@ -3,6 +3,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { decide, type Policy, type Receipt, spentToday } from "./policy";
+import type { Task } from "./request";
 import type { Paid, Quote } from "./wallet";
 
 export type Purchase = Receipt & { key: string; macaroon: string; quote: Quote; fee_limit_sat: number };
@@ -12,12 +13,15 @@ export class Store {
 	constructor(dir: string) {
 		mkdirSync(dir, { recursive: true, mode: 0o700 });
 		chmodSync(dir, 0o700);
-		this.db = new Database(join(dir, "payments.sqlite"));
-		chmodSync(join(dir, "payments.sqlite"), 0o600);
+		const dbPath = join(dir, "payments.sqlite");
+		this.db = new Database(dbPath);
+		chmodSync(dbPath, 0o600);
 		this.db.exec(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
 			CREATE TABLE IF NOT EXISTS receipts (id INTEGER PRIMARY KEY, data TEXT NOT NULL);
 			CREATE TABLE IF NOT EXISTS purchases (hash TEXT PRIMARY KEY, key TEXT NOT NULL, receipt_id INTEGER NOT NULL, data TEXT NOT NULL);
 			CREATE TABLE IF NOT EXISTS tokens (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+			CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+			CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, task_id TEXT NOT NULL, ts TEXT NOT NULL, kind TEXT NOT NULL, duration_ms REAL);
 			CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY);`);
 		this.db.transaction(() => {
 			if (this.db.query("SELECT key FROM metadata WHERE key='imported'").get()) return;
@@ -40,7 +44,7 @@ export class Store {
 		return this.db.query("INSERT INTO receipts(data) VALUES (?)").run(JSON.stringify(this.receipt(r))).lastInsertRowid;
 	}
 	private receipt(r: Receipt): Receipt {
-		return { ts: r.ts, url: r.url, service: r.service, amount_sat: r.amount_sat, fee_sat: r.fee_sat,
+		return { ts: r.ts, task_id: r.task_id, url: r.url, service: r.service, amount_sat: r.amount_sat, fee_sat: r.fee_sat,
 			payment_hash: r.payment_hash, approval: r.approval, outcome: r.outcome, wallet: r.wallet,
 			proof_of_payment: r.proof_of_payment, reason: r.reason };
 	}
@@ -56,10 +60,54 @@ export class Store {
 	token(key: string): string | undefined {
 		return (this.db.query("SELECT value FROM tokens WHERE key=?").get(key) as { value: string } | null)?.value;
 	}
+	task(id: string): Task {
+		const row = this.db.query("SELECT data FROM tasks WHERE id=?").get(id) as { data: string } | null;
+		if (!row) throw new Error("Unknown request");
+		return JSON.parse(row.data);
+	}
+	tasks(): Task[] {
+		return (this.db.query("SELECT data FROM tasks ORDER BY rowid DESC").all() as { data: string }[]).map(r => JSON.parse(r.data));
+	}
+	createTask(task: Task) {
+		this.db.query("INSERT INTO tasks VALUES (?, ?)").run(task.id, JSON.stringify(task));
+		this.event(task.id, "created");
+	}
+	updateTask(id: string, update: (task: Task) => void) {
+		return this.db.transaction(() => {
+			const task = this.task(id);
+			const previous = task.status;
+			update(task);
+			this.db.query("UPDATE tasks SET data=? WHERE id=?").run(JSON.stringify(task), id);
+			if (task.status !== previous) this.event(id, task.status);
+			return task;
+		}).immediate();
+	}
+	event(id: string, kind: string, durationMs?: number) {
+		this.db.query("INSERT INTO events(task_id, ts, kind, duration_ms) VALUES (?, ?, ?, ?)")
+			.run(id, new Date().toISOString(), kind, durationMs ?? null);
+	}
+	events(id: string) {
+		return this.db.query("SELECT ts, kind, duration_ms FROM events WHERE task_id=? ORDER BY id").all(id);
+	}
+	taskSpent(id: string) {
+		return this.ledger().filter(r => r.task_id === id && (r.outcome === "paid" || r.outcome === "pending"))
+			.reduce((n, r) => n + r.amount_sat + r.fee_sat, 0);
+	}
+	checkTask(id: string, href: string, amount = 0, fee = 0) {
+		const task = this.task(id);
+		if (task.status !== "running") throw new Error("Task is not running; no new purchases allowed");
+		if (!task.resourcePath || href !== task.provider + task.resourcePath) throw new Error("Resource is outside the approved task plan");
+		if (this.taskSpent(id) + amount + fee > task.budgetSat) throw new Error("Purchase exceeds the remaining task budget");
+		return task;
+	}
 	reserve(p: Purchase, maxSats: number, policy: Policy, now = new Date()): void {
 		this.db.transaction(() => {
 			if (this.forKey(p.key) || this.db.query("SELECT hash FROM purchases WHERE hash=?").get(p.payment_hash))
 				throw new Error("purchase already recorded; reconcile it before retrying");
+			if (p.task_id) {
+				const task = this.checkTask(p.task_id, p.url, p.amount_sat, p.fee_limit_sat);
+				if (p.amount_sat + p.fee_limit_sat > task.autoApproveSat && p.approval !== "human") throw new Error("human approval required for task");
+			}
 			const ledger = this.ledger();
 			if (ledger.some(r => (r.outcome === "paid" || r.outcome === "pending") &&
 				(r.payment_hash === p.payment_hash || `${new URL(r.url).origin} ${r.service}` === p.key)))
@@ -72,6 +120,7 @@ export class Store {
 			p.fee_sat = p.fee_limit_sat;
 			const id = this.record(p);
 			this.db.query("INSERT INTO purchases VALUES (?, ?, ?, ?)").run(p.payment_hash, p.key, id, JSON.stringify(p));
+			if (p.task_id) this.event(p.task_id, "payment_reserved");
 		}).immediate();
 	}
 	finish(hash: string, result: Paid | "failed", now = new Date()): void {
@@ -99,6 +148,7 @@ export class Store {
 				if (result.feeSat > p.fee_limit_sat) p.reason = "wallet exceeded the authorized fee limit";
 			}
 			this.db.query("UPDATE purchases SET data=? WHERE hash=?").run(JSON.stringify(p), hash);
+			if (p.task_id) this.event(p.task_id, `payment_${p.outcome}`);
 			this.db.query("UPDATE receipts SET data=? WHERE id=?").run(JSON.stringify(this.receipt(p)), row.receipt_id);
 		}).immediate();
 	}

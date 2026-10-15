@@ -67,9 +67,9 @@ test("legacy files import once without modification", () => {
 	} finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("10,000 seeded fault sequences match an independent allowance model", () => fixture(store => {
+test("100,000 seeded fault sequences match an independent allowance model", () => fixture(store => {
 	let reservations = 0;
-	for (let seed = 1; seed <= 10_000; seed++) {
+	for (let seed = 1; seed <= 100_000; seed++) {
 		store.db.exec("DELETE FROM purchases; DELETE FROM receipts; DELETE FROM tokens;");
 		let random = seed;
 		const next = () => (random = (Math.imul(random, 1664525) + 1013904223) >>> 0);
@@ -81,8 +81,12 @@ test("10,000 seeded fault sequences match an independent allowance model", () =>
 			const total = () => [...model.values()].reduce((sum, p) => sum + (p.pending || p.day === day ? p.amount + p.fee : 0), 0);
 			const id = `${seed}-${step}`;
 			const amount = next() % 80 + 1;
-			if (total() + amount + 10 <= 100) {
-				store.reserve(purchase(id, amount), 100, policy, clock);
+			const autoApproveSats = next() % 101;
+			const human = next() % 3 === 0;
+			const candidate = { ...purchase(id, amount), approval: human ? "human" as const : "auto" as const };
+			const limits = { ...policy, autoApproveSats };
+			if (total() + amount + 10 <= 100 && (human || amount + 10 <= autoApproveSats)) {
+				store.reserve(candidate, 100, limits, clock);
 				model.set(id, { amount, fee: 10, pending: true, day });
 				reservations++;
 				const fault = next() % 4;
@@ -94,13 +98,13 @@ test("10,000 seeded fault sequences match an independent allowance model", () =>
 				}
 				// Lost response or missing wallet record keeps the full reservation.
 				if (fault >= 2) expect(() => store.reserve(purchase(id, amount), 100, policy, clock)).toThrow();
-			} else expect(() => store.reserve(purchase(id, amount), 100, policy, clock)).toThrow();
+			} else expect(() => store.reserve(candidate, 100, limits, clock)).toThrow();
 			expect(spentToday(store.ledger(), clock)).toBe(total());
 			expect(total()).toBeLessThanOrEqual(100);
 		}
 	}
-	console.log(`Seeded accounting: 10000 sequences, 80000 transitions, ${reservations} reservations; seed range 1..10000`);
-}), 120_000);
+	console.log(`Seeded accounting: 100000 sequences, 800000 transitions, ${reservations} reservations; seed range 1..100000`);
+}), 300_000);
 
 for (const stage of ["before-reserve", "inside-reserve", "after-reserve", "inside-settlement", "after-settlement"]) test(`process death ${stage} preserves an atomic ledger`, async () => {
 	const dir = mkdtempSync(join(tmpdir(), "l402-crash-"));
@@ -152,4 +156,38 @@ test("legacy pending receipts keep fee reserves across midnight and block repaym
 			expect(() => store.reserve(purchase(), 100, policy, tomorrow)).toThrow("previous payment exists");
 		} finally { store.close(); }
 	} finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("task budgets survive UTC rollover and enforce approved resources and stops", () => fixture(store => {
+	const input = { resourcePath: "/v1/hashprice", budgetSat: 30, autoApproveSat: 10, id: "task", createdAt: now.toISOString(),
+		provider: "https://provider.test", status: "running" as const };
+	store.createTask(input);
+	const p = { ...purchase(), task_id: "task", url: "https://provider.test/v1/hashprice" };
+	expect(() => store.reserve(p, 100, policy, now)).toThrow("human approval");
+	expect(() => store.reserve({ ...p, approval: "human", url: "https://evil.test/v1/hashprice" }, 100, policy, now)).toThrow("approved task plan");
+	store.reserve({ ...p, approval: "human" }, 100, policy, now);
+	expect(store.taskSpent("task")).toBe(30);
+	expect(() => store.checkTask("task", p.url, 1)).toThrow("task budget");
+	store.finish(hash, { feeSat: 3, preimage: proof }, tomorrow);
+	expect(store.taskSpent("task")).toBe(23);
+	store.updateTask("task", t => { t.status = "stopped"; });
+	expect(() => store.checkTask("task", p.url)).toThrow("not running");
+}));
+
+test("independent processes cannot reserve the same task allowance twice", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "l402-task-race-"));
+	const store = new Store(dir);
+	try {
+		store.createTask({ id: "race", resourcePath: "/v1/hashprice", budgetSat: 30, autoApproveSat: 100, createdAt: now.toISOString(), provider: "https://provider.test",
+			status: "running" });
+		const workers = Array.from({length:8}, (_, i) => {
+			const p = { ...purchase(`race-${i}`), task_id: "race", url: "https://provider.test/v1/hashprice" };
+			return Bun.spawn([process.execPath, "-e", `import { Store } from ${JSON.stringify(join(import.meta.dir, "store.ts"))};
+			const store = new Store(${JSON.stringify(dir)});
+			try { store.reserve(${JSON.stringify(p)}, 100, {autoApproveSats:100,dailyBudgetSats:1000}); process.stdout.write('reserved'); }
+			catch { process.stdout.write('refused'); } finally { store.close(); }`], {stdout:"pipe",stderr:"pipe"});
+		});
+		const results = await Promise.all(workers.map(async p => { expect(await p.exited).toBe(0); return new Response(p.stdout).text(); }));
+		expect(results.filter(r=>r==='reserved')).toHaveLength(1); expect(store.taskSpent("race")).toBe(30);
+	} finally { store.close(); rmSync(dir, {recursive:true,force:true}); }
 });

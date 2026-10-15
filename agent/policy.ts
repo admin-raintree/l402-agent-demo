@@ -5,6 +5,7 @@ export type Policy = { autoApproveSats: number; dailyBudgetSats: number };
 
 export type Receipt = {
 	ts: string;
+	task_id?: string;
 	url: string;
 	service: string;
 	amount_sat: number;
@@ -31,16 +32,17 @@ export function spentToday(ledger: Receipt[], now = new Date()): number {
 export function decide(amountSats: number, maxSats: number, spent: number, policy: Policy, feeLimitSats = 0): Decision {
 	if (![amountSats, maxSats, spent, policy.autoApproveSats, policy.dailyBudgetSats, feeLimitSats].every(n => Number.isSafeInteger(n) && n >= 0))
 		return { kind: "refuse", reason: "invalid spending policy, amount, or fee limit" };
-	if (!Number.isInteger(amountSats) || amountSats <= 0)
+	if (amountSats <= 0)
 		return { kind: "refuse", reason: "invoice has no fixed amount; refusing to pay an open-ended invoice" };
-	if (amountSats + feeLimitSats > maxSats) return { kind: "refuse", reason: `price plus maximum fees ${amountSats + feeLimitSats} sats exceeds max_sats ${maxSats}` };
-	if (spent + amountSats + feeLimitSats > policy.dailyBudgetSats)
+	const cost = amountSats + feeLimitSats;
+	if (cost > maxSats) return { kind: "refuse", reason: `price plus maximum fees ${cost} sats exceeds max_sats ${maxSats}` };
+	if (spent + cost > policy.dailyBudgetSats)
 		return {
 			kind: "refuse",
 			reason: `would exceed the daily budget: ${spent} of ${policy.dailyBudgetSats} sats already charged or reserved`,
 		};
-	if (amountSats + feeLimitSats > policy.autoApproveSats)
-		return { kind: "ask", reason: `price plus maximum fees ${amountSats + feeLimitSats} sats is above the ${policy.autoApproveSats}-sat auto-approve limit` };
+	if (cost > policy.autoApproveSats)
+		return { kind: "ask", reason: `price plus maximum fees ${cost} sats is above the ${policy.autoApproveSats}-sat auto-approve limit` };
 	return { kind: "pay" };
 }
 

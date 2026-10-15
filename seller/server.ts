@@ -10,6 +10,7 @@ type Market = typeof snapshot;
 let cache: { at: number; market: Market } | undefined;
 
 async function market(): Promise<Market> {
+	if (process.env.L402_FIXED_MARKET === "1") return snapshot;
 	if (cache && Date.now() - cache.at < 60_000) return cache.market;
 	try {
 		const get = (path: string) =>
@@ -106,7 +107,7 @@ Bun.serve({
 			case "/v1/breakeven": {
 				const j = Number(url.searchParams.get("j_per_th") ?? 17.5);
 				const kwh = Number(url.searchParams.get("usd_per_kwh") ?? 0.05);
-				if (!(j > 0 && kwh >= 0)) return Response.json({ error: "j_per_th must be > 0 and usd_per_kwh >= 0" }, { status: 400 });
+				if (!(Number.isFinite(j) && Number.isFinite(kwh) && j > 0 && kwh >= 0)) return Response.json({ error: "j_per_th must be > 0 and usd_per_kwh >= 0" }, { status: 400 });
 				const m = await market();
 				return Response.json({ as_of: m.as_of, source: m.source, ...breakeven(m, j, kwh) });
 			}

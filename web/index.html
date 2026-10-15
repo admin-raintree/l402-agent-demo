@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>L402 resource viewer · Raintree Technology</title>
+<link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script>
+</head>
+<body>
+<header><div class="header-inner"><span class="brand"><svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" aria-hidden="true" viewBox="0 0 32 32" fill="none">
+  
+  <g stroke="currentColor" stroke-width="1.2" stroke-linecap="round">
+    <line x1="16" y1="29" x2="16" y2="5"/>
+    <line x1="16" y1="22" x2="24" y2="14"/>
+    <line x1="16" y1="22" x2="8" y2="14"/>
+    <line x1="16" y1="16" x2="22" y2="10"/>
+    <line x1="16" y1="16" x2="10" y2="10"/>
+    <line x1="16" y1="10" x2="20" y2="6"/>
+    <line x1="16" y1="10" x2="12" y2="6"/>
+  </g>
+</svg><span>Raintree Technology</span></span><h1 class="product-label">L402 / Resource workspace</h1><span class="badge">Local workspace</span></div></header>
+<main>
+<div class="workspace">
+<section class="allowance" aria-labelledby="allowance-heading">
+<div><h2 id="allowance-heading">Daily allowance</h2><p id="policy">Shared across requests. Includes fees and unresolved payments.</p></div>
+<div class="allowance-value"><span>Paid or reserved</span><strong id="daily-spent">—</strong></div>
+<div class="allowance-value"><span>Remaining</span><strong id="daily-remaining">—</strong></div>
+</section>
+<div class="layout">
+<section class="panel" aria-labelledby="new-request-heading"><div class="panel-heading"><h2 id="new-request-heading">New request</h2><span class="toolbar-note">Setup</span></div>
+<form id="task-form"><p class="setup-note">Set the resource and spending limits for your next request.</p>
+<label for="resourcePath">Resource path</label><input id="resourcePath" name="resourcePath" value="/v1/hashprice" maxlength="2048" required list="examples" aria-describedby="resource-hint"><datalist id="examples"><option value="/v1/hashprice"><option value="/v1/breakeven"><option value="/v1/report"></datalist>
+<p id="resource-hint" class="hint">A path on your configured provider. Mining examples are test fixtures.</p>
+<div class="pair"><div><label for="budgetSat">Request budget (sats)</label><input id="budgetSat" name="budgetSat" type="number" min="0" max="1000000" step="1" value="100" required aria-describedby="limits-hint"></div><div><label for="autoApproveSat">Auto-approval limit (sats)</label><input id="autoApproveSat" name="autoApproveSat" type="number" min="0" max="1000000" step="1" value="0" required aria-describedby="limits-hint"></div></div>
+<p id="limits-hint" class="hint">Both limits include fees. Set auto-approval to 0 to review every payment.</p>
+<button type="submit">Create request</button><p class="form-note">Creating a request does not spend money.</p>
+</form></section>
+<section class="request-pane" aria-labelledby="tasks-heading"><div class="section-title"><div class="request-picker"><label for="selected-request" id="tasks-heading">Request</label><select id="selected-request" disabled><option>No requests yet</option></select></div><button id="refresh" class="secondary">Refresh</button></div><p id="notice" role="status" aria-live="polite"></p><div id="tasks"><div class="empty"><h3>No requests yet</h3><p>Create a request to review its cost and fetch a response.</p></div></div></section>
+</div>
+</div>
+<footer><span>L402 resource viewer · Local test workflow</span><span>Payment does not guarantee delivery or useful content.</span></footer>
+</main>
+</body></html>

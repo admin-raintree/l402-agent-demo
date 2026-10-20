@@ -1,8 +1,8 @@
 # Controlled L402 resource viewer
 
-Choose a resource, set a spending limit, approve or decline its Lightning invoice, and inspect the response and receipt. The dashboard uses an MCP wallet server and SQLite accounting to track authorization, payment, and delivery.
+Choose a resource, set a spending limit, approve or decline its Lightning invoice, and inspect the response and receipt. The dashboard uses an MCP wallet server and SQLite accounting to track authorization, payment, and delivery. The same wallet supports recurring purchases under a standing approval, with a litd account as an independent spending ceiling.
 
-[Run the demo](#start-the-local-demo) · [Full walkthrough](docs/README.md) · [Configuration](docs/reference.md) · [Verification results](VERIFICATION.md)
+[Run the demo](#start-the-local-demo) · [Subscriptions](#subscriptions) · [litd allowance](#independent-allowance-with-litd) · [Full walkthrough](docs/README.md) · [Configuration](docs/reference.md) · [Verification results](VERIFICATION.md)
 
 ## How a purchase works
 
@@ -54,10 +54,32 @@ Ctrl-C stops the network. State and logs remain in the printed temporary directo
 
 This is a trusted local application. Payment does not guarantee delivery or useful content; see [payment boundaries](docs/reference.md#payment-controls-and-boundaries).
 
+## Subscriptions
+
+A human approves a subscription once: up to a set number of sats per period, including maximum fees, to one provider's service, for a fixed number of periods. After that, the MCP wallet renews an expired credential without asking again.
+
+- `l402_subscribe` asks for the standing approval; `l402_subscriptions` lists or cancels subscriptions.
+- A renewal happens only after the credential's own expiry has passed. Aperture adds that expiry when a service sets `timeout`. A 402 before the expiry pays nothing.
+- At most one renewal is paid per period, and the daily budget still applies. Concurrent processes cannot both pay for one period.
+- After cancellation, the paid credential works until it expires, then nothing renews.
+
+`bun run verify:local` includes a regtest subscription run: one prompt, two renewals, a refused second renewal within a period, and cancellation. Subscriptions apply to the MCP server, not to dashboard requests. See the [subscriptions design and limits](docs/subscriptions.md).
+
+## Independent allowance with litd
+
+A litd account limits spending even when the payer bypasses this application's policy. Build litd v0.17.7 and run the check:
+
+```sh
+bun run build:litd
+bun run verify:litd
+```
+
+On regtest, a 100-sat account rejected a 101-sat payment through litd and through lnd's own RPC port. It counted the maximum fee and held five concurrent payments to the allowance. The wallet does not yet pay through an account macaroon; see the [litd results](VERIFICATION.md#litd-account-allowance).
+
 ## Documentation
 
 - [Animated walkthrough](docs/README.md): all 12 steps, accounting, and recovery paths.
 - [Configuration and operations](docs/reference.md): existing networks, wallet setup, MCP tools, and stored state.
-- [Run the checks](docs/reference.md#verify): unit, browser, and local Lightning checks.
+- [Run the checks](docs/reference.md#verify): unit, browser, local Lightning, and litd allowance checks.
 - [Verification results and limitations](VERIFICATION.md): observed results and unverified behavior.
 - [Subscriptions](docs/subscriptions.md): 30-day credentials, standing approvals, renewal rules, and litd account backstops.

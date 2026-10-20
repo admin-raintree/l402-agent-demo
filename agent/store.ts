@@ -4,9 +4,12 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { decide, type Policy, type Receipt, spentToday } from "./policy";
 import type { Task } from "./request";
+import { periodAt, periodKey, subscriptionState, type Subscription } from "./subscription";
 import type { Paid, Quote } from "./wallet";
 
-export type Purchase = Receipt & { key: string; macaroon: string; quote: Quote; fee_limit_sat: number };
+export type Purchase = Receipt & { key: string; macaroon: string; quote: Quote; fee_limit_sat: number;
+	/** Set when a standing approval, not a prompt, authorized this purchase. */
+	subscription?: { id: string; period: number } };
 
 export class Store {
 	readonly db: Database;
@@ -22,7 +25,10 @@ export class Store {
 			CREATE TABLE IF NOT EXISTS tokens (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 			CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, data TEXT NOT NULL);
 			CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, task_id TEXT NOT NULL, ts TEXT NOT NULL, kind TEXT NOT NULL, duration_ms REAL);
-			CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY);`);
+			CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY);
+			CREATE TABLE IF NOT EXISTS subscriptions (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+			CREATE TABLE IF NOT EXISTS renewals (subscription_id TEXT NOT NULL, period INTEGER NOT NULL, payment_hash TEXT NOT NULL,
+				PRIMARY KEY (subscription_id, period));`);
 		this.db.transaction(() => {
 			if (this.db.query("SELECT key FROM metadata WHERE key='imported'").get()) return;
 			const ledger = join(dir, "receipts.jsonl");
@@ -45,7 +51,7 @@ export class Store {
 	}
 	private receipt(r: Receipt): Receipt {
 		return { ts: r.ts, task_id: r.task_id, url: r.url, service: r.service, amount_sat: r.amount_sat, fee_sat: r.fee_sat,
-			payment_hash: r.payment_hash, approval: r.approval, outcome: r.outcome, wallet: r.wallet,
+			payment_hash: r.payment_hash, approval: r.approval, subscription_id: r.subscription_id, outcome: r.outcome, wallet: r.wallet,
 			proof_of_payment: r.proof_of_payment, reason: r.reason };
 	}
 	ledger(): Receipt[] {
@@ -100,8 +106,65 @@ export class Store {
 		if (this.taskSpent(id) + amount + fee > task.budgetSat) throw new Error("Purchase exceeds the remaining task budget");
 		return task;
 	}
+	createSubscription(sub: Subscription) {
+		this.db.query("INSERT INTO subscriptions VALUES (?, ?)").run(sub.id, JSON.stringify(sub));
+	}
+	subscription(id: string): Subscription {
+		const row = this.db.query("SELECT data FROM subscriptions WHERE id=?").get(id) as { data: string } | null;
+		if (!row) throw new Error("Unknown subscription");
+		return JSON.parse(row.data);
+	}
+	subscriptions(): Subscription[] {
+		return (this.db.query("SELECT data FROM subscriptions ORDER BY rowid DESC").all() as { data: string }[]).map(r => JSON.parse(r.data));
+	}
+	/** Newest subscription for a service in any state; a cancelled one still holds a valid credential. */
+	subscriptionFor(origin: string, service: string): Subscription | undefined {
+		return this.subscriptions().find(s => s.origin === origin && s.service === service);
+	}
+	cancelSubscription(id: string, now = new Date()): Subscription {
+		return this.db.transaction(() => {
+			const sub = this.subscription(id);
+			if (sub.status === "cancelled") return sub;
+			sub.status = "cancelled";
+			sub.cancelledAt = now.toISOString();
+			this.db.query("UPDATE subscriptions SET data=? WHERE id=?").run(JSON.stringify(sub), id);
+			return sub;
+		}).immediate();
+	}
+	/** Newest period that holds a credential. */
+	subscriptionToken(sub: Subscription): { token: string; period: number } | undefined {
+		for (let k = sub.periods - 1; k >= 0; k--) {
+			const token = this.token(periodKey(sub, k));
+			if (token) return { token, period: k };
+		}
+	}
+	periodSpent(id: string, period: number) {
+		return this.purchases().filter(p => p.subscription?.id === id && p.subscription.period === period &&
+			(p.outcome === "paid" || p.outcome === "pending")).reduce((n, p) => n + p.amount_sat + p.fee_sat, 0);
+	}
+	private checkSubscription(p: Purchase, now: Date) {
+		if (!p.subscription) return;
+		if (p.task_id) throw new Error("request-bound purchases cannot use a subscription");
+		const sub = this.subscription(p.subscription.id);
+		const state = subscriptionState(sub, now);
+		if (state !== "active") throw new Error(`subscription ${state}; renewal refused`);
+		const period = p.subscription.period;
+		if (periodAt(sub, now) !== period) throw new Error("renewal is outside the current subscription period");
+		if (p.approval !== "standing" || p.key !== periodKey(sub, period)) throw new Error("renewal does not match its subscription");
+		if (new URL(p.url).origin !== sub.origin || p.service !== sub.service) throw new Error("renewal is for a different provider or service");
+		if (sub.nodePubkey && p.quote.destination && p.quote.destination !== sub.nodePubkey)
+			throw new Error("renewal invoice pays a different node than the subscription names");
+		const spent = this.periodSpent(sub.id, period);
+		if (spent + p.amount_sat + p.fee_limit_sat > sub.capSat)
+			throw new Error(`renewal would exceed the ${sub.capSat}-sat cap for period ${period}: ${spent} sats already charged or reserved`);
+		if (this.db.query("SELECT payment_hash FROM renewals WHERE subscription_id=? AND period=?").get(sub.id, period))
+			throw new Error(`subscription already renewed for period ${period}`);
+		this.db.query("INSERT INTO renewals VALUES (?, ?, ?)").run(sub.id, period, p.payment_hash);
+		p.subscription_id = sub.id;
+	}
 	reserve(p: Purchase, maxSats: number, policy: Policy, now = new Date()): void {
 		this.db.transaction(() => {
+			if (p.approval === "standing" && !p.subscription) throw new Error("standing approval requires a subscription");
 			if (this.forKey(p.key) || this.db.query("SELECT hash FROM purchases WHERE hash=?").get(p.payment_hash))
 				throw new Error("purchase already recorded; reconcile it before retrying");
 			if (p.task_id) {
@@ -114,7 +177,8 @@ export class Store {
 				throw new Error("previous payment exists for this service; automatic repayment blocked");
 			const d = decide(p.amount_sat, maxSats, spentToday(ledger, now), policy, p.fee_limit_sat);
 			if (d.kind === "refuse") throw new Error(d.reason);
-			if (d.kind === "ask" && p.approval !== "human") throw new Error("human approval required");
+			if (d.kind === "ask" && p.approval !== "human" && !p.subscription) throw new Error("human approval required");
+			this.checkSubscription(p, now);
 			p.ts = now.toISOString();
 			p.outcome = "pending";
 			p.fee_sat = p.fee_limit_sat;
@@ -132,6 +196,8 @@ export class Store {
 			if (result === "failed") {
 				p.outcome = "failed";
 				p.fee_sat = 0;
+				// A confirmed failure frees the period for a fresh invoice.
+				this.db.query("DELETE FROM renewals WHERE payment_hash=?").run(hash);
 			} else {
 				if (!Number.isSafeInteger(result.feeSat) || result.feeSat < 0) throw new Error("invalid settlement fee; reservation retained");
 				if (p.outcome === "pending") p.ts = now.toISOString();

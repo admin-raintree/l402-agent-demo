@@ -12,7 +12,8 @@ export type Receipt = {
 	fee_sat: number;
 	payment_hash: string;
 	preimage?: string;
-	approval: "auto" | "human" | "none";
+	approval: "auto" | "human" | "standing" | "none";
+	subscription_id?: string;
 	outcome: "paid" | "pending" | "failed" | "declined" | "refused";
 	proof_of_payment?: boolean;
 	wallet?: "lnd" | "wavelength";

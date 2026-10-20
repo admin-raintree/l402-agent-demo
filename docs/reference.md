@@ -51,7 +51,7 @@ bun test
 bun run verify:local
 ```
 
-The first command includes 100,000 seeded accounting sequences, concurrent processes, crash recovery, hostile responses, and request authorization checks. The second creates an isolated regtest network, runs real Lightning payments, reconciles buyer and seller histories, and verifies a complete dashboard resource purchase. It retains logs and stops its daemons on exit.
+The first command includes 100,000 seeded accounting sequences, concurrent processes, crash recovery, hostile responses, and request authorization checks. The second creates an isolated regtest network, runs real Lightning payments, reconciles buyer and seller histories, and verifies a complete dashboard resource purchase and a subscription renewal. It retains logs and stops its daemons on exit.
 
 Browser checks use an existing Playwright installation and Google Chrome:
 
@@ -79,6 +79,10 @@ The existing [`.mcp.json`](../.mcp.json) configuration remains available. The se
 - `l402_discover`: discover services and advertised prices.
 - `l402_fetch`: fetch a resource, enforce spending limits, request human approval when needed, and reuse paid credentials.
 - `l402_wallet`: reconcile wallet activity and inspect spending and receipts.
+- `l402_subscribe`: ask the human once for a standing approval (a cap per period, including fees, for a number of periods) to one provider's service.
+- `l402_subscriptions`: list subscriptions or cancel one. A cancelled subscription keeps its paid credential until that credential expires.
+
+With a subscription, `l402_fetch` renews an expired credential at most once per period without prompting; the daily budget still applies. Request-bound dashboard processes do not use subscriptions. See [Subscriptions](subscriptions.md).
 
 The `lnd` backend is restricted to the local regtest configuration. Wavelength integration uses its REST API; live settlement and independent fee enforcement remain unverified.
 

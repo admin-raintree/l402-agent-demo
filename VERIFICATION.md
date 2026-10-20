@@ -38,7 +38,7 @@ Telemetry retains state events and durations. Tests check that dashboard payment
 1. Run `bun install --frozen-lockfile`.
 2. Run `bun test`.
 3. Run `bun run build:binaries` if `.bin` is absent.
-4. Run `bun run verify:local` for an isolated network and both smoke tests.
+4. Run `bun run verify:local` for an isolated network and the payment, resource, and subscription smoke tests.
 5. Run `PLAYWRIGHT_MODULE=/path/to/installed/playwright bun run test:browser`. Chrome must already be installed, or select an installed channel through `PLAYWRIGHT_CHANNEL`.
 6. Run `bun run build:litd`, then `bun run verify:litd` for the litd account allowance check.
 
@@ -91,6 +91,22 @@ The official [test-network guide](https://github.com/lightninglabs/wavelength/bl
 3. Compare the ledger payment hash with wallet activity and the seller's settled invoice. Verify the preimage hash and successful resource response.
 4. Restart the MCP process and repeat the fetch. Require credential reuse and an unchanged count of settled wallet payments.
 5. Repeat with a dropped response and confirm that recovery does not send again. Compare the actual wallet outflow, including swap fees, against the approved maximum.
+
+## Subscriptions
+
+On 2026-10-19, `bun test` passed 67 tests in 134.53 seconds: the original 58 plus 9 in `agent/subscription.test.ts`. The seeded accounting result is unchanged (281,882 reservations). `bun run verify:local` passed all three smoke tests, including the new subscription smoke.
+
+| Check | Observed result | Boundary |
+|---|---|---|
+| Aperture `timeout` caveat | `timeout: 4` minted `hashprice_valid_until` at mint time plus 4 s; the service without a timeout had no expiry caveat; Aperture answered the expired credential with a fresh 402 | Live regtest Aperture v0.5.0, static pricing. Dynamic pricing not tested. |
+| Standing approval | One prompt at subscription time with auto-approval at 0; two renewals paid without prompts; receipts record `approval: "standing"` | Regtest; 20 sats per 12-second period. |
+| One renewal per period | Expired credential inside period 0 refused; renewal paid at the start of period 1. Eight racing processes produced one reservation for one period | Live regtest plus local SQLite. |
+| Cancellation and expiry | After cancel, the paid credential kept working until its expiry, then no renewal. Expired and scheduled states refuse | Live regtest plus unit tests. |
+| Limits | Cap includes the maximum fee; daily budget still applies; provider, service, node, period, and key must match; pending blocks and confirmed failure frees the period | Unit tests with injected clocks. |
+| Early 402 | A 402 before the credential's own expiry is treated as a rejection and pays nothing | MCP test against a mock provider. |
+| Reconciliation | Both renewals settled; preimages hash to payment hashes; fees and seller invoices match receipts | Live regtest. |
+
+Not covered: dashboard requests with subscriptions, manifest subscription terms, paying through a litd account macaroon, and real 30-day periods. Timing tests use second-scale periods.
 
 ## litd account allowance
 

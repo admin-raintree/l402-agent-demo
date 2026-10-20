@@ -3,7 +3,7 @@
 // caveat, then drives the MCP server through one standing approval and its renewals.
 import { strict as assert } from "node:assert";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -12,57 +12,17 @@ import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { parseChallenge } from "../agent/policy";
 import { macaroonCaveats } from "../agent/subscription";
 import { lndWallet } from "../agent/wallet";
+import { startTimedAperture, TIMED_API as API } from "./timed-aperture";
 
 const ROOT = resolve(import.meta.dir, "..");
 const DEMO = process.env.L402_DEMO_DIR ?? resolve(ROOT, ".demo");
-const API = "http://127.0.0.1:8702";
 const TIMEOUT_SECONDS = 4;
 const PERIOD_SECONDS = 12;
 const step = (s: string) => console.log(`\n${s}`);
 
-// A second Aperture in front of the same seller; only the subscribed service gets a timeout.
-const base = join(DEMO, "aperture-sub");
-mkdirSync(base, { recursive: true });
-writeFileSync(join(DEMO, "aperture-sub.yaml"), `listenaddr: "127.0.0.1:8702"
-insecure: true
-autocert: false
-debuglevel: "info"
-strictverify: true
-dbbackend: "sqlite"
-sqlite:
-  databasefilename: "${base}/aperture.db"
-authenticator:
-  network: "regtest"
-  lndhost: "127.0.0.1:10020"
-  tlspath: "${DEMO}/seller/tls.cert"
-  macdir: "${DEMO}/seller/data/chain/bitcoin/regtest"
-services:
-  - name: "catalog"
-    hostregexp: '.*'
-    pathregexp: '^/\\.well-known/.*$'
-    address: "127.0.0.1:8701"
-    protocol: http
-    price: 0
-    authwhitelistpaths: ['^/\\.well-known/.*$']
-  - name: "hashprice"
-    hostregexp: '.*'
-    pathregexp: '^/v1/hashprice.*$'
-    address: "127.0.0.1:8701"
-    protocol: http
-    price: 10
-    timeout: ${TIMEOUT_SECONDS}
-`);
-const aperture = Bun.spawn([resolve(ROOT, ".bin/aperture"), `--configfile=${join(DEMO, "aperture-sub.yaml")}`, `--basedir=${base}`],
-	{ stdout: Bun.file(join(DEMO, "logs/aperture-sub.log")), stderr: "inherit" });
-writeFileSync(join(DEMO, "aperture-sub.pid"), String(aperture.pid)); // down.sh stops it if this script dies
+const stopAperture = await startTimedAperture(ROOT, DEMO, TIMEOUT_SECONDS);
 let client: Client | undefined;
 try {
-	for (let i = 0; ; i++) {
-		if ((await fetch(`${API}/.well-known/l402.json`).catch(() => undefined))?.ok) break;
-		if (i > 120) throw new Error("second Aperture did not start; see logs/aperture-sub.log");
-		await Bun.sleep(250);
-	}
-
 	step(`1. Aperture's timeout setting adds an expiry caveat (source claim, checked live)`);
 	const caveatsAt = async (origin: string) => {
 		const res = await fetch(`${origin}/v1/hashprice`);
@@ -164,7 +124,5 @@ try {
 	console.log("\nSubscription smoke test passed.");
 } finally {
 	await client?.close();
-	aperture.kill();
-	await aperture.exited;
-	rmSync(join(DEMO, "aperture-sub.pid"), { force: true });
+	await stopAperture();
 }

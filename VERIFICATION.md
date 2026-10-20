@@ -40,7 +40,7 @@ Telemetry retains state events and durations. Tests check that dashboard payment
 3. Run `bun run build:binaries` if `.bin` is absent.
 4. Run `bun run verify:local` for an isolated network and the payment, resource, and subscription smoke tests.
 5. Run `PLAYWRIGHT_MODULE=/path/to/installed/playwright bun run test:browser`. Chrome must already be installed, or select an installed channel through `PLAYWRIGHT_CHANNEL`.
-6. Run `bun run build:litd`, then `bun run verify:litd` for the litd account allowance check.
+6. Run `bun run build:litd`, then `bun run verify:litd` for the litd account allowance check and the subscription through a litd account.
 
 `up` now refuses a nonempty state directory. The verification command creates a fresh temporary directory and keeps startup and smoke testing in the same shell. Existing `.demo` state is preserved.
 
@@ -106,7 +106,7 @@ On 2026-10-19, `bun test` passed 67 tests in 134.53 seconds: the original 58 plu
 | Early 402 | A 402 before the credential's own expiry is treated as a rejection and pays nothing | MCP test against a mock provider. |
 | Reconciliation | Both renewals settled; preimages hash to payment hashes; fees and seller invoices match receipts | Live regtest. |
 
-Not covered: dashboard requests with subscriptions, manifest subscription terms, paying through a litd account macaroon, and real 30-day periods. Timing tests use second-scale periods.
+Not covered: dashboard requests with subscriptions, manifest subscription terms, and real 30-day periods. Paying through a litd account macaroon is covered [below](#litd-account-subscription). Timing tests use second-scale periods.
 
 ## litd account allowance
 
@@ -125,6 +125,37 @@ Each run gave the same result. The interceptor reserves each payment's principal
 Source reading, not an observed race: `accounts/checkers.go` `checkSend` calls `CheckBalance` (read lock) and then `AssociatePayment` (write lock) separately. lndclient's `RegisterRPCMiddleware` handles intercepted requests one at a time on a single stream, which closes that window in practice. Five concurrent payments were tested; larger fan-out was not.
 
 The script keeps the account macaroon in the owner-only state directory and preimages in memory. It prints neither. Build litd with `bun run build:litd`. Logs from the four runs were written to session scratch files, not committed paths.
+
+## litd account subscription
+
+On 2026-10-19, the MCP wallet paid a subscription through a litd account macaroon. The `L402_LND_*` overrides pointed lncli at litd (`127.0.0.1:8443`, `lit/tls.cert`). Checks run:
+
+- `bun test`: 72 tests passed in 67.93 s. That is the previous 67 plus 5 in `agent/lnd-wallet.test.ts`, which pin the default lncli arguments and the overrides.
+- `bun run verify:local`: passed the payment, resource and subscription smokes. `subscription-smoke.ts` now starts its Aperture through the shared `scripts/timed-aperture.ts`.
+- `bun run verify:litd`: passed twice in a row. Each run included the allowance check and the new [`scripts/litd-subscription-smoke.ts`](scripts/litd-subscription-smoke.ts). An earlier attempt failed before any check ran: another session's regtest network was using the same fixed ports.
+
+Both passing runs gave the same results. The second run added the direct `lndWallet.pay` check in the second-directory row:
+
+| Check | Observed result |
+|---|---|
+| Wallet calls through the account | `decodepayreq`, `payinvoice`, `listpayments` and `channelbalance` all succeeded with the account macaroon. |
+| `channelbalance` | 40 sats: the account's virtual balance. The real channel held 1,998,996 sats. `l402_wallet` reported `balance_sat` 20 after the renewals. |
+| Account | 40 sats (20-sat cap × 2 periods), with an expiration date set at creation to 2 × 12 s + 10 s. It therefore expired about 8 s after the subscription's last period ended. |
+| Subscription | One prompt (auto-approval 0). Periods 0 and 1 each paid 10 + 0 sats under the standing approval. |
+| Second MCP state directory | No subscription; auto-approval 100, daily budget 1,000. It approved a 50-sat purchase without a prompt. The MCP result was `pending` ("payment unresolved"), with 60 sats reserved in that directory. Seller invoice `OPEN`, no buyer payment record, account unchanged at 20. The same `lndWallet.pay` call on a fresh 50-sat invoice failed with `error validating account balance: account balance insufficient`. |
+| Direct lncli on lnd's port | 11 sats with a 10-sat fee limit (21 > 20): `account balance insufficient`; invoice `OPEN`; balance 20. |
+| After expiry | A 5-sat payment with fee limit 0 (it fits the 20-sat balance): `account <id> has expired`. The wallet's `channelbalance` failed with the same error. |
+| Reconciliation | Account 40 → 20 = the sum of the two receipts including fees. Both buyer payments `SUCCEEDED`; preimages hash to the payment hashes; seller invoices `SETTLED` for 10 sats each. |
+
+Observed in a manual probe on the same versions, not asserted by the script: `listpayments` through the account returned only the account's payments, but `last_index_offset` still counted the payments it filtered out. A one-payment page past an admin payment came back empty, with offsets 2 → 2.
+
+Inferred, not tested:
+
+- The 20 sats left in the account are the unused fee reserve. Any holder of the macaroon could spend them on any invoice until expiry. A payment that fit them was not attempted.
+- The wallet's `listpayments` lookup stops at the first empty page. Through litd it could report `unknown` for an account payment behind more than 100 payments from other macaroons.
+- After expiry, reconciliation through `listpayments` is probably refused too, like `channelbalance`.
+
+The application records a litd refusal as an unresolved payment, not a failure. It keeps the reservation and blocks retries, as for a lost response. This is safe but needs manual cleanup. The account macaroon stays in the owner-only state directory. Logs were scanned for macaroon and preimage values; none were found.
 
 ## Limits of the evidence
 

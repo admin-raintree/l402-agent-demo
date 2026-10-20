@@ -1,5 +1,6 @@
 // Wallet backends decode invoices, send payments, reconcile outcomes, and report balances.
-//   lnd:        shells out to lncli with a baked pay-only macaroon.
+//   lnd:        shells out to lncli with a baked pay-only macaroon, or with any macaroon, RPC
+//               server and TLS certificate from L402_LND_* (e.g. a litd account macaroon).
 //   wavelength: calls a Wavelength (waved) daemon's wallet REST API, so the agent pays
 //               from a self-custodial Ark wallet without running a Lightning node.
 import { readFileSync } from "node:fs";
@@ -32,15 +33,19 @@ export type Wallet = {
 	lookup(quote: Quote): Promise<PaymentStatus>;
 };
 
-export function lndWallet(root: string, demo: string): Wallet {
+/** Unset or empty L402_LND_* variables keep the demo buyer node and its pay-only macaroon. */
+export function lndWallet(root: string, demo: string, env: Record<string, string | undefined> = process.env): Wallet {
+	const rpcserver = env.L402_LND_RPCSERVER || "127.0.0.1:10019";
+	const tlscert = env.L402_LND_TLSCERT || `${demo}/buyer/tls.cert`;
+	const macaroon = env.L402_LND_MACAROON || `${demo}/agent-pay.macaroon`;
 	async function lncli(...args: string[]): Promise<string> {
 		const p = Bun.spawn(
 			[
 				resolve(root, ".bin/lncli"),
 				"--network=regtest",
-				"--rpcserver=127.0.0.1:10019",
-				`--tlscertpath=${demo}/buyer/tls.cert`,
-				`--macaroonpath=${demo}/agent-pay.macaroon`,
+				`--rpcserver=${rpcserver}`,
+				`--tlscertpath=${tlscert}`,
+				`--macaroonpath=${macaroon}`,
 				...args,
 			],
 			{ stdout: "pipe", stderr: "pipe" },
@@ -176,7 +181,7 @@ export function wavelengthWallet(o: WavelengthOptions): Wallet {
 }
 
 export function walletFromEnv(root: string, demo: string, env = process.env): Wallet {
-	if ((env.L402_WALLET ?? "lnd") === "lnd") return lndWallet(root, demo);
+	if ((env.L402_WALLET ?? "lnd") === "lnd") return lndWallet(root, demo, env);
 	if (env.L402_WALLET !== "wavelength") throw new Error(`unknown L402_WALLET ${env.L402_WALLET}`);
 	if (!env.WAVELENGTH_URL) throw new Error("L402_WALLET=wavelength needs WAVELENGTH_URL");
 	return wavelengthWallet({

@@ -74,7 +74,9 @@ bun run build:litd
 bun run verify:litd
 ```
 
-On regtest, a 100-sat account rejected a 101-sat payment through litd and through lnd's own RPC port. It counted the maximum fee and held five concurrent payments to the allowance. The wallet does not yet pay through an account macaroon; see the [litd results](VERIFICATION.md#litd-account-allowance).
+On regtest, a 100-sat account rejected a 101-sat payment through litd and through lnd's own RPC port. It counted the maximum fee and held five concurrent payments to the allowance.
+
+The wallet can pay through an account macaroon. Set `L402_LND_MACAROON`, `L402_LND_RPCSERVER` and `L402_LND_TLSCERT` ([configuration](docs/reference.md#pay-through-a-litd-account)). In `verify:litd`, a 40-sat account (20-sat cap × 2 periods) paid both renewals. It then refused a 50-sat purchase that a second MCP state directory approved automatically, a direct 21-sat payment, and a payment after the account expired. The account balance matched the receipts. See the [litd results](VERIFICATION.md#litd-account-subscription).
 
 ## Documentation
 

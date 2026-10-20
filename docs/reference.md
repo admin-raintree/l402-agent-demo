@@ -68,7 +68,7 @@ bun run build:litd
 bun run verify:litd
 ```
 
-It builds litd v0.17.7 without the web UI, starts a fresh network whose buyer lnd accepts RPC middleware, and runs litd in remote mode. It then sends payments directly with a 100-sat account macaroon. Port 8443 and the ports used by `up` must be free.
+It builds litd v0.17.7 without the web UI, starts a fresh network whose buyer lnd accepts RPC middleware, and runs litd in remote mode. It then sends payments directly with a 100-sat account macaroon. Next, it runs a subscription through the MCP server with a 40-sat account macaroon, then checks that litd refuses payments the application would allow. Port 8443 and the ports used by `up` (and 8702) must be free. Two networks on one machine collide on these fixed ports.
 
 See [verification results](../VERIFICATION.md) for measurements, the recovery matrix, and limits of the evidence.
 
@@ -87,6 +87,18 @@ With a subscription, `l402_fetch` renews an expired credential at most once per 
 The `lnd` backend is restricted to the local regtest configuration. Wavelength integration uses its REST API; live settlement and independent fee enforcement remain unverified.
 
 To configure a dedicated Wavelength test wallet, set `L402_WALLET=wavelength`, `WAVELENGTH_URL`, `WAVELENGTH_MACAROON_PATH`, and `WAVELENGTH_TLS_CERT`. Use a macaroon restricted to `PrepareSend`, `Send`, `List`, and `Balance`. Wallet setup and scoped-macaroon details are in the upstream Wavelength documentation; the tested API contract is recorded in [VERIFICATION.md](../VERIFICATION.md).
+
+### Pay through a litd account
+
+The `lnd` backend reads three optional variables. Unset or empty variables keep the defaults: the buyer node at `127.0.0.1:10019`, `$L402_DEMO_DIR/buyer/tls.cert`, and `$L402_DEMO_DIR/agent-pay.macaroon`.
+
+```sh
+export L402_LND_MACAROON="$L402_DEMO_DIR/sub-account.macaroon"   # from litcli accounts create --save_to
+export L402_LND_RPCSERVER=127.0.0.1:8443                          # litd; lnd's own port is also intercepted
+export L402_LND_TLSCERT="$L402_DEMO_DIR/lit/tls.cert"
+```
+
+Through an account, `l402_wallet` reports the account's virtual balance, not channel liquidity. A payment litd refuses stays a pending reservation, and after the account expires `l402_wallet` fails. See [Paying through a litd account](subscriptions.md#paying-through-a-litd-account).
 
 ## State and limits
 

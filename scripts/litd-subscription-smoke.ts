@@ -11,7 +11,7 @@ import { join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { lndWallet } from "../agent/wallet";
+import { lndWallet, PaymentFailed } from "../agent/wallet";
 import { startTimedAperture, TIMED_API } from "./timed-aperture";
 
 const ROOT = resolve(import.meta.dir, "..");
@@ -138,15 +138,19 @@ try {
 	const extra = await b.call("l402_fetch", { url: "http://127.0.0.1:8700/v1/breakeven", max_sats: 100 });
 	assert.equal(b.prompts(), 0, "the second state directory asked for approval");
 	assert.notEqual(extra.status, 200, "the bypass purchase was delivered");
+	assert.equal(extra.outcome, "failed", "litd's pre-send refusal was not recorded as a failed payment");
 	const extraInvoice = await invoiceState(extra.payment_hash);
 	assert.equal(extraInvoice.state, "OPEN");
 	assert.equal(Number(extraInvoice.amt_paid_sat), 0);
 	assert.equal(await buyerPayment(extra.payment_hash), undefined, "lnd recorded a payment attempt");
 	assert.equal(await balance(id), afterSub);
 	const bWallet = await b.call("l402_wallet", {});
+	assert.equal(bWallet.reserved_sat, 0, "the refused purchase left a reservation");
 	// The server does not surface the wallet's error, so repeat its wallet call to show litd's reason.
 	const same = await seller("addinvoice", "--amt=50", "--memo=litd-sub-wallet") as { r_hash: string; payment_request: string };
-	const walletErr = await account.pay(same.payment_request, await account.quote(same.payment_request, 10), 10).then(() => "", e => String(e.message));
+	const walletFailure = await account.pay(same.payment_request, await account.quote(same.payment_request, 10), 10).then(() => undefined, (e: Error) => e);
+	assert(walletFailure instanceof PaymentFailed, `expected PaymentFailed, got ${walletFailure}`);
+	const walletErr = walletFailure.message;
 	assert.match(walletErr, /account balance insufficient/);
 	assert.equal((await invoiceState(same.r_hash)).state, "OPEN");
 	await seller("cancelinvoice", same.r_hash);

@@ -2,7 +2,7 @@
 
 Subscriptions add recurring payments to the MCP wallet. A seller sells a 30-day credential. The buyer grants a standing approval once, and the wallet renews within that approval without asking again.
 
-Status: the buyer side is implemented in the unbound MCP server ([`agent/subscription.ts`](../agent/subscription.ts), [`agent/store.ts`](../agent/store.ts), [`agent/server.ts`](../agent/server.ts)). Dashboard requests, manifest subscription terms, and paying through a litd account macaroon are not implemented.
+Status: the buyer side is implemented in the unbound MCP server ([`agent/subscription.ts`](../agent/subscription.ts), [`agent/store.ts`](../agent/store.ts), [`agent/server.ts`](../agent/server.ts)). The wallet can pay through a litd account macaroon ([below](#paying-through-a-litd-account)). Dashboard requests and manifest subscription terms are not implemented.
 
 [Back to the project](../README.md) · [Configuration](reference.md) · [Verification results](../VERIFICATION.md)
 
@@ -84,12 +84,42 @@ The [litd allowance check](../VERIFICATION.md#litd-account-allowance) observed t
 | Human or standing approval | Yes | No |
 | Total ceiling including maximum fees | Yes, if the wallet honors its fee cap | Yes, observed on regtest |
 | Concurrent spenders | Yes, within one state directory | Yes, observed with five payments |
-| Process holding credentials bypasses the app | Not enforced | Still enforced; its own RPC port is covered |
+| Process holding credentials bypasses the app | Not enforced | Still enforced; its own RPC port is covered; observed with a second MCP state directory and direct lncli |
 
-Recommended setup, not yet wired in: the subscription wallet pays with an account macaroon, not the current `agent-pay` macaroon. The account is created for the subscription's lifetime total (cap × periods) and expires when the subscription ends (`litcli accounts create <sats> --expiration_date <unix>`). The application enforces the fine-grained rules. The account is the backstop if the application or its state is bypassed. A tighter backstop is to fund one period at a time with `litcli accounts credit`, from an operator process outside the agent. That needs a scheduler.
+## Paying through a litd account
+
+The lnd wallet reads three optional variables. Without them, it uses the demo buyer node and its `agent-pay` macaroon, as before.
+
+| Variable | Through litd | Default |
+|---|---|---|
+| `L402_LND_MACAROON` | the account macaroon from `litcli accounts create --save_to` | `$L402_DEMO_DIR/agent-pay.macaroon` |
+| `L402_LND_RPCSERVER` | `127.0.0.1:8443` (litd), or `127.0.0.1:10019` (lnd's own port, still intercepted) | `127.0.0.1:10019` |
+| `L402_LND_TLSCERT` | `$L402_DEMO_DIR/lit/tls.cert` (or lnd's certificate for lnd's port) | `$L402_DEMO_DIR/buyer/tls.cert` |
+
+Create the account for the subscription's lifetime total (cap × periods). Set it to expire when the subscription ends: `litcli accounts create <sats> --expiration_date <unix> --save_to <file>`. The application enforces the fine-grained rules. The account is the backstop if the application or its state is bypassed.
+
+Observed on regtest by [`scripts/litd-subscription-smoke.ts`](../scripts/litd-subscription-smoke.ts), run from `bun run verify:litd`:
+
+- The account macaroon covers all four lncli calls the wallet makes: `decodepayreq`, `payinvoice`, `listpayments` and `channelbalance`.
+- `channelbalance` reports the account's virtual balance, not channel liquidity: 40 sats while the real channel held about 2,000,000. `l402_wallet`'s `balance_sat` is therefore the remaining allowance.
+- `listpayments` returns only the account's payments.
+- A 40-sat account (cap 20 × 2 periods) paid both renewals with one prompt; 40 → 20 sats, matching the receipts.
+- A second MCP state directory, with no subscription and auto-approval at 100 sats, approved a 50-sat purchase without a prompt. litd refused it with `account balance insufficient`. A direct `lncli payinvoice` on lnd's own port (11 sats, 10-sat fee limit) was refused the same way.
+- After the expiration date, a 5-sat payment that fit the balance was refused with `account … has expired`, and `channelbalance` failed with the same error.
+
+The four-call coverage, the virtual balance, and the expiry errors were first seen in a manual probe on the same versions, then asserted by the script.
+
+Consequences:
+
+1. **A litd refusal stays a pending reservation in the app.** The server does not classify the wallet's error. It cannot tell a refusal before sending from a lost response. So it reconciles, finds no payment, and keeps the fee-inclusive reservation (60 sats in the test) with retries blocked. That is safe, but the refused purchase needs manual cleanup.
+2. **Unused fee reserve stays spendable.** The account is sized at cap × periods, and each cap includes a 10-sat maximum fee. Renewals that pay no routing fee leave that headroom in the account, 20 sats in the test, until expiry. Anyone holding the macaroon can spend it on any invoice. *Inferred from the balance arithmetic*: a payment that fit the 20 sats was not attempted before expiry.
+3. **After expiry, `l402_wallet` fails.** Its balance call is refused. Reconciliation through `listpayments` is presumably refused too (not tested), so pending payments from that account cannot be resolved through it.
+4. **Pagination through litd.** *Observed in a manual probe, not in the script*: `listpayments` filters out other payments but keeps lnd's unfiltered offsets. A page can come back empty while later account payments exist. *Inferred, not tested*: the wallet's lookup stops at the first empty page. It could report `unknown` for a payment hidden behind more than 100 non-account payments.
+
+A tighter backstop is to fund one period at a time with `litcli accounts credit`, from an operator process outside the agent. That needs a scheduler.
 
 The account does not know about periods, providers or approvals. Its balance is virtual, so the node operator must keep the real channel liquidity behind it.
 
 ## Verify
 
-`bun test agent/subscription.test.ts` covers period math, macaroon parsing, cap and fee limits, one renewal per period, failure and pending outcomes, provider and node binding, cancellation, expiry, a cross-process race, and an MCP flow against a mock provider. `bun run verify:local` adds the regtest subscription smoke. It approves 20 sats per 12-second period with auto-approval at zero, then pays twice with one prompt. It refuses a second renewal within a period, honors cancellation, and reconciles both payments with buyer and seller records.
+`bun test agent/subscription.test.ts` covers period math, macaroon parsing, cap and fee limits, one renewal per period, failure and pending outcomes, provider and node binding, cancellation, expiry, a cross-process race, and an MCP flow against a mock provider. `bun run verify:local` adds the regtest subscription smoke. It approves 20 sats per 12-second period with auto-approval at zero, then pays twice with one prompt. It refuses a second renewal within a period, honors cancellation, and reconciles both payments with buyer and seller records. `bun run verify:litd` repeats the subscription through a litd account macaroon and tests the backstop. `bun test agent/lnd-wallet.test.ts` checks the `L402_LND_*` overrides and the unchanged defaults.

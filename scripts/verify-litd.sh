@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Start a fresh regtest network whose buyer lnd accepts RPC middleware, attach litd in
-# remote mode with accounts enabled, and test the account allowance outside the MCP policy.
+# remote mode with accounts enabled, test the account allowance outside the MCP policy, then run
+# a subscription through the MCP wallet with an account macaroon.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export L402_DEMO_DIR="$(mktemp -d "${TMPDIR:-/tmp}/l402-litd.XXXXXX")"
@@ -26,3 +27,4 @@ for _ in $(seq 120); do litcli accounts list >/dev/null 2>&1 && break; sleep 0.5
 litcli accounts list >/dev/null || { tail -n 20 "$D/logs/litd.log" >&2; exit 1; }
 
 bun "$ROOT/scripts/litd-allowance.ts"
+bun "$ROOT/scripts/litd-subscription-smoke.ts"

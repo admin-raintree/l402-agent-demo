@@ -98,7 +98,7 @@ export L402_LND_RPCSERVER=127.0.0.1:8443                          # litd; lnd's 
 export L402_LND_TLSCERT="$L402_DEMO_DIR/lit/tls.cert"
 ```
 
-Through an account, `l402_wallet` reports the account's virtual balance, not channel liquidity. A payment litd refuses stays a pending reservation, and after the account expires `l402_wallet` fails. See [Paying through a litd account](subscriptions.md#paying-through-a-litd-account).
+Through an account, `l402_wallet` reports the account's virtual balance, not channel liquidity. A payment litd refuses for exceeding the balance is recorded as failed and releases its reservation; later fetches retry and are refused again until the account is topped up. A refusal because the account expired stays a pending reservation, and after expiry `l402_wallet` fails. See [Paying through a litd account](subscriptions.md#paying-through-a-litd-account).
 
 ## State and limits
 

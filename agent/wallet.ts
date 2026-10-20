@@ -34,6 +34,10 @@ export type Wallet = {
 };
 
 /** Unset or empty L402_LND_* variables keep the demo buyer node and its pay-only macaroon. */
+// litd's checkSend wraps ErrAccBalanceInsufficient this way, and lncli prints it as a gRPC status.
+// Matching the whole status keeps other output that merely mentions the phrase unresolved.
+const LITD_OVER_BALANCE = /rpc error: code = \w+ desc = error validating account balance: account balance insufficient\s*$/;
+
 export function lndWallet(root: string, demo: string, env: Record<string, string | undefined> = process.env): Wallet {
 	const rpcserver = env.L402_LND_RPCSERVER || "127.0.0.1:10019";
 	const tlscert = env.L402_LND_TLSCERT || `${demo}/buyer/tls.cert`;
@@ -68,7 +72,7 @@ export function lndWallet(root: string, demo: string, env: Record<string, string
 				// litd's account checker rejects an over-balance SendPaymentV2 request before lnd runs it, so
 				// no HTLC left. litd's "account <id> has expired" stays unresolved: litd also checks expiry on
 				// each streamed payment update, so that error can arrive after HTLCs were sent.
-				if (/account balance insufficient/.test(String(e))) throw new PaymentFailed(`payment refused: ${(e as Error).message}`);
+				if (LITD_OVER_BALANCE.test(String(e))) throw new PaymentFailed(`payment refused: ${(e as Error).message}`);
 				throw e;
 			}
 			const status = [...out.matchAll(/"status":\s*"(\w+)"/g)].at(-1)?.[1];

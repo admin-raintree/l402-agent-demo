@@ -17,7 +17,14 @@ Aperture v0.5.0 already supports expiring credentials through each service's `ti
 
 Observed on regtest by [`scripts/subscription-smoke.ts`](../scripts/subscription-smoke.ts): with `timeout: 4`, the minted macaroon carried `services`, `hashprice_capabilities`, and `hashprice_valid_until` set to mint time plus 4 seconds. The same service without a timeout carried no expiry caveat. After expiry, Aperture answered the old credential with a fresh 402.
 
-So `timeout: 2592000` gives each paid credential a 30-day life, starting when the challenge is minted, not when the invoice is paid. One inference has not been tested: the timeout map is keyed by service name, tier and the configured price, while challenges are minted with the price the pricer returns. With `dynamicprice` enabled, the two prices can differ, so the expiry caveat may be silently omitted. Use static pricing for subscription services until this is tested.
+So `timeout: 2592000` gives each paid credential a 30-day life, starting when the challenge is minted, not when the invoice is paid.
+
+Use an explicit static `price` for subscription services. In v0.5.0 the limiter keys `timeout`, `capabilities` and `constraints` by the configured service name, tier and price ([`services.go:35-39`](https://github.com/lightninglabs/aperture/blob/v0.5.0/services.go#L35-L39)). The mint looks them up with the name and price of the challenge, and skips any service it cannot find. Two configurations miss the lookup:
+
+1. `dynamicprice`: the challenge is named after the service plus the request path ([`proxy/service.go:184-190`](https://github.com/lightninglabs/aperture/blob/v0.5.0/proxy/service.go#L184-L190)) and priced by the pricer, so neither matches.
+2. No `price`: the limiter is built before `prepareServices` applies the default price of 1, so it holds price 0 while the challenge has price 1.
+
+Observed on regtest with v0.5.0 and a stub pricer: in both cases the macaroon carried only `services`, with no `_valid_until`, `_capabilities` or constraint caveat. A credential minted this way never expires. Aperture master fixed this in [`771f371`](https://github.com/lightninglabs/aperture/commit/771f371ba5dcd4f11b864b0caa4ae5c233d9cc4a), which keys by name and tier. No tagged release contains that fix yet. The same check against master minted every caveat. Evidence, commands and a backport patch: [VERIFICATION.md](../VERIFICATION.md#aperture-dynamicprice-and-the-timeout-caveat) and [`docs/upstream/`](upstream/).
 
 Optionally, and not implemented, the discovery manifest can state the terms, so the buyer can check an invoice against the advertised offer:
 

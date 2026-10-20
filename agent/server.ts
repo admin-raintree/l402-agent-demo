@@ -15,7 +15,6 @@ const ROOT = resolve(import.meta.dir, "..");
 const DEMO = process.env.L402_DEMO_DIR ?? resolve(ROOT, ".demo");
 const STATE = process.env.L402_STATE_DIR ?? resolve(DEMO, "agent");
 const FEE_LIMIT_SATS = 10;
-const taskId = process.env.L402_TASK_ID;
 const policy = {
 	autoApproveSats: Number(process.env.L402_AUTO_APPROVE_SATS ?? 100),
 	dailyBudgetSats: Number(process.env.L402_DAILY_BUDGET_SATS ?? 5000),
@@ -160,7 +159,6 @@ server.registerTool(
 	},
 	async ({ url: href, max_sats, method, body }) => serialized(async () => {
 		const url = new URL(href);
-		if (taskId) store.checkTask(taskId, url.href);
 		if (!["https:", "http:"].includes(url.protocol) || url.username || url.password) throw new Error("invalid provider URL");
 		if (!manifests.has(url.origin)) await discover(url.origin).catch(() => undefined);
 		const service = serviceFor(url);
@@ -179,8 +177,7 @@ server.registerTool(
 					reason: "resource response unavailable; delivery is unknown; automatic repayment blocked" });
 			}
 		};
-		// Subscriptions apply to the unbound MCP server; dashboard requests keep their own budgets.
-		const sub = taskId ? undefined : store.subscriptionFor(url.origin, service);
+		const sub = store.subscriptionFor(url.origin, service);
 		let first: Response | undefined;
 		let standing: { sub: Subscription; period: number } | undefined;
 		if (sub) {
@@ -227,7 +224,7 @@ server.registerTool(
 		if (!challenge) return json({ status: 402, paid: false, error: "402 response without an L402 challenge" });
 		const quote = await wallet.quote(challenge.invoice, FEE_LIMIT_SATS);
 		if (!/^[0-9a-f]{64}$/.test(quote.paymentHash)) throw new Error("wallet returned an invalid payment hash");
-		const base = { task_id: taskId, ts: new Date().toISOString(), url: url.href, service, wallet: wallet.name,
+		const base = { ts: new Date().toISOString(), url: url.href, service, wallet: wallet.name,
 			amount_sat: quote.amountSat, fee_sat: 0, payment_hash: quote.paymentHash };
 		const stop = (outcome: "declined" | "refused", reason: string, approval: Receipt["approval"] = "none") => {
 			store.record({ ...base, approval, outcome, reason, subscription_id: standing?.sub.id });
@@ -238,17 +235,13 @@ server.registerTool(
 			return stop("refused", "invoice pays a different node than the provider's manifest names");
 		const maxSats = standing ? Math.min(max_sats, standing.sub.capSat) : max_sats;
 		const spent = spentToday(store.ledger());
-		let task;
-		try { if (taskId) task = store.checkTask(taskId, url.href, base.amount_sat, FEE_LIMIT_SATS); }
-		catch (e) { return stop("refused", e instanceof Error ? e.message : "Task refused purchase"); }
-		const decision = decide(base.amount_sat, maxSats, spent,
-			{ ...policy, autoApproveSats: Math.min(policy.autoApproveSats, task?.autoApproveSat ?? Infinity) }, FEE_LIMIT_SATS);
+		const decision = decide(base.amount_sat, maxSats, spent, policy, FEE_LIMIT_SATS);
 		if (decision.kind === "refuse") return stop("refused", decision.reason);
 		if (decision.kind === "ask" && !standing) {
 			let denied: string | undefined;
 			try {
-				denied = await askHuman(`Approve ${base.amount_sat} sats plus up to ${FEE_LIMIT_SATS} sats in fees for ${method} ${url.href} (${service})? ` +
-					`Payment: ${quote.paymentHash}. Remaining daily allowance: ${Math.max(0, policy.dailyBudgetSats - spent)} sats. ${decision.reason}.`);
+				denied = await askHuman(`Pay ${base.amount_sat} sats plus up to ${FEE_LIMIT_SATS} sats in fees for ${method} ${url.href} (${service})? ` +
+					`That is above your ${policy.autoApproveSats}-sat auto-approval limit. ${Math.max(0, policy.dailyBudgetSats - spent).toLocaleString("en-US")} sats remain in today's budget.`);
 			} catch { denied = "approval unavailable or disconnected"; }
 			if (denied) return stop("declined", denied, "human");
 		}
@@ -305,7 +298,6 @@ server.registerTool(
 		annotations: { readOnlyHint: false, openWorldHint: true },
 	},
 	async ({ url: href, cap_sats_per_period, periods, period_seconds }) => serialized(async () => {
-		if (taskId) throw new Error("request-bound MCP processes cannot create subscriptions");
 		const url = new URL(href);
 		const manifest = await discover(url.origin);
 		const service = serviceFor(url);

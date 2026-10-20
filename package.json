@@ -10,11 +10,8 @@
     "down": "scripts/down.sh",
     "test": "bun test",
     "smoke": "bun scripts/smoke.ts",
-    "dashboard": "bun dashboard/server.ts",
     "verify:local": "bash scripts/verify-local.sh",
-    "verify:litd": "bash scripts/verify-litd.sh",
-    "test:browser": "bun scripts/browser-check.ts",
-    "demo": "bash scripts/demo.sh"
+    "verify:litd": "bash scripts/verify-litd.sh"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",

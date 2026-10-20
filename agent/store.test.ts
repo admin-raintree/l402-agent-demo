@@ -158,36 +158,18 @@ test("legacy pending receipts keep fee reserves across midnight and block repaym
 	} finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("task budgets survive UTC rollover and enforce approved resources and stops", () => fixture(store => {
-	const input = { resourcePath: "/v1/hashprice", budgetSat: 30, autoApproveSat: 10, id: "task", createdAt: now.toISOString(),
-		provider: "https://provider.test", status: "running" as const };
-	store.createTask(input);
-	const p = { ...purchase(), task_id: "task", url: "https://provider.test/v1/hashprice" };
-	expect(() => store.reserve(p, 100, policy, now)).toThrow("human approval");
-	expect(() => store.reserve({ ...p, approval: "human", url: "https://evil.test/v1/hashprice" }, 100, policy, now)).toThrow("approved task plan");
-	store.reserve({ ...p, approval: "human" }, 100, policy, now);
-	expect(store.taskSpent("task")).toBe(30);
-	expect(() => store.checkTask("task", p.url, 1)).toThrow("task budget");
-	store.finish(hash, { feeSat: 3, preimage: proof }, tomorrow);
-	expect(store.taskSpent("task")).toBe(23);
-	store.updateTask("task", t => { t.status = "stopped"; });
-	expect(() => store.checkTask("task", p.url)).toThrow("not running");
-}));
-
-test("independent processes cannot reserve the same task allowance twice", async () => {
-	const dir = mkdtempSync(join(tmpdir(), "l402-task-race-"));
+test("independent processes cannot reserve the same daily budget twice", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "l402-budget-race-"));
 	const store = new Store(dir);
 	try {
-		store.createTask({ id: "race", resourcePath: "/v1/hashprice", budgetSat: 30, autoApproveSat: 100, createdAt: now.toISOString(), provider: "https://provider.test",
-			status: "running" });
 		const workers = Array.from({length:8}, (_, i) => {
-			const p = { ...purchase(`race-${i}`), task_id: "race", url: "https://provider.test/v1/hashprice" };
+			const p = purchase(`race-${i}`);
 			return Bun.spawn([process.execPath, "-e", `import { Store } from ${JSON.stringify(join(import.meta.dir, "store.ts"))};
 			const store = new Store(${JSON.stringify(dir)});
-			try { store.reserve(${JSON.stringify(p)}, 100, {autoApproveSats:100,dailyBudgetSats:1000}); process.stdout.write('reserved'); }
+			try { store.reserve(${JSON.stringify(p)}, 100, {autoApproveSats:100,dailyBudgetSats:30}); process.stdout.write('reserved'); }
 			catch { process.stdout.write('refused'); } finally { store.close(); }`], {stdout:"pipe",stderr:"pipe"});
 		});
 		const results = await Promise.all(workers.map(async p => { expect(await p.exited).toBe(0); return new Response(p.stdout).text(); }));
-		expect(results.filter(r=>r==='reserved')).toHaveLength(1); expect(store.taskSpent("race")).toBe(30);
+		expect(results.filter(r=>r==='reserved')).toHaveLength(1); expect(spentToday(store.ledger())).toBe(30);
 	} finally { store.close(); rmSync(dir, {recursive:true,force:true}); }
 });

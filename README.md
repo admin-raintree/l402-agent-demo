@@ -1,87 +1,127 @@
-# Controlled L402 resource viewer
+# L402 agent wallet
 
-Choose a resource, set a spending limit, approve or decline its Lightning invoice, and inspect the response and receipt. The dashboard uses an MCP wallet server and SQLite accounting to track authorization, payment, and delivery. The same wallet supports recurring purchases under a standing approval, with a litd account as an independent spending ceiling.
+An MCP server that lets an AI agent pay for HTTP APIs over Lightning, within limits you set.
 
-[Run the demo](#start-the-local-demo) · [Subscriptions](#subscriptions) · [litd allowance](#independent-allowance-with-litd) · [Full walkthrough](docs/README.md) · [Configuration](docs/reference.md) · [Verification results](VERIFICATION.md)
+[L402](https://docs.lightning.engineering/the-lightning-network/l402) is Lightning Labs' protocol for charging for an API. The server answers `402 Payment Required` with a Lightning invoice and a macaroon. The client pays the invoice and sends `L402 <macaroon>:<preimage>` as a reusable credential.
 
-## How a purchase works
+Giving an agent a wallet to do this is risky. It could overspend, pay twice after a network error, or be tricked by a provider. This server sits between the agent and the wallet and decides what gets paid.
 
-This illustrated purchase costs 20 sats plus a 3-sat actual fee, with a 10-sat maximum fee authorized before payment. No funds move in the animations.
+```mermaid
+flowchart LR
+    Agent[AI agent] -->|MCP| Server[This MCP server]
+    Server -->|over the limit?| You[You approve]
+    Server -->|lncli payinvoice| Buyer[lnd: buyer]
+    Buyer -->|Lightning payment| Seller[lnd: seller]
+    Server -->|HTTP + L402 credential| Aperture
+    Aperture -->|creates invoices| Seller
+    Aperture -->|proxies| API[API]
+```
 
-### 1. Request a resource
+## Built on Lightning Labs software
 
-Choose a resource and spending limits; the server obtains a payment quote before spending anything.
+| Component | Version | Role here |
+|---|---|---|
+| [lnd](https://github.com/lightningnetwork/lnd) | v0.21.3-beta | The buyer and seller Lightning nodes. The agent pays through `lncli` with a macaroon limited to `offchain:read`, `offchain:write`, and `info:read`. |
+| [Aperture](https://github.com/lightninglabs/aperture) | v0.5.0 | The seller's L402 reverse proxy. It answers unpaid requests with a 402, an invoice from the seller's lnd, and a macaroon, then checks credentials and proxies paid requests to the API. |
+| [Lightning Terminal (litd)](https://github.com/lightninglabs/lightning-terminal) | v0.17.7 | Optional. A litd account caps what its macaroon can spend. lnd enforces it through litd's RPC middleware, even for payments that bypass this server. |
+| [Wavelength](https://github.com/lightninglabs/wavelength) | API at `2c4f1ee` | Optional wallet backend that pays from an Ark wallet without running a Lightning node. Not yet tested against a live daemon. |
 
-![Request animation: the server requests a resource and receives an HTTP 402 payment challenge.](docs/assets/payment-request.gif)
+The rest isn't from Lightning Labs. [btcd](https://github.com/btcsuite/btcd) runs the regtest chain. This project adds the MCP server, the spending policy, the SQLite ledger, the demo seller, and its `/.well-known/l402.json` discovery file. That file is this project's own convention, not part of L402 or Aperture.
 
-### 2. Approve the maximum cost
+## How a payment works
 
-With automatic approval at zero, review and approve up to 30 sats, including the maximum fee.
+1. The agent calls `l402_fetch` with a URL and the most it's willing to spend (`max_sats`).
+2. Aperture replies `402` with an invoice and a macaroon. The server decodes the invoice with lnd and adds the 10-sat maximum routing fee.
+3. It checks the limits. Up to the auto-approval amount, it pays without asking. Above that, it asks you to approve. Above `max_sats` or the daily budget, it refuses.
+4. Before paying, it reserves the full amount in a local SQLite database. Two agents sharing the database can't both spend the same budget.
+5. It pays through lnd with the fee limit, checks that the preimage matches the invoice's payment hash, and records the actual cost. A 30-sat reservation might settle as 23 sats.
+6. It retries the request with `L402 <macaroon>:<preimage>`. Aperture verifies it and proxies to the API. Later requests to the same service reuse the credential without paying again.
 
-![Approval animation: the policy asks a human to approve a maximum of 30 sats.](docs/assets/payment-approval.gif)
+If lnd's answer is lost (a crash or a timeout), the payment stays reserved and is never resent. The next call looks it up in lnd's payment history instead.
 
-### 3. Reserve, pay, and verify
+## Try it
 
-Reserve 30 sats before sending, then record the actual 23-sat charge and verified credential after settlement.
-
-![Payment animation: a 30-sat reservation becomes a 23-sat settled charge.](docs/assets/payment-settlement.gif)
-
-### 4. Inspect and reuse
-
-Inspect the response and receipt; later requests can reuse the credential without another payment.
-
-![Response animation: the paid credential unlocks a resource response.](docs/assets/payment-response.gif)
-
-Follow the [12-step walkthrough](docs/README.md) for the implementation, recovery paths, and still-image alternatives. Each overview clip plays once for five seconds and may finish before you scroll to it.
-
-## Start the local demo
-
-Requires Bun and Go 1.26+ to build the pinned binaries. Existing source checkouts must be clean and at their pinned tags.
+Requires [Bun](https://bun.sh) and Go 1.26+. Everything runs on a local Bitcoin test network (regtest) with test coins.
 
 ```sh
 bun install --frozen-lockfile
-bun run build:binaries  # Skip if the pinned binaries are already installed.
-bun run demo
+bun run build:binaries   # builds lnd, Aperture, and btcd from source into .bin/
+bun run up               # starts btcd, two lnd nodes, Aperture, and the demo seller in .demo/
 ```
 
-Open **http://127.0.0.1:8787**. The demo uses an isolated Bitcoin regtest network and test coins.
+Open Claude Code (or another MCP client) in this directory. It picks up the server from [`.mcp.json`](.mcp.json), which auto-approves up to 100 sats with a 5,000-sat daily budget. Then ask it to:
 
-1. Enter `/v1/hashprice`, set a budget, and leave auto-approval at zero to review payment.
-2. Select **Create request**, then **Start request**.
-3. Approve or decline the payment, then inspect the response and receipt.
+1. Fetch `http://127.0.0.1:8700/v1/hashprice`. It costs 10 sats plus up to 10 in fees, so it's paid without asking.
+2. Fetch it again. The saved credential is reused and nothing is paid.
+3. Fetch `http://127.0.0.1:8700/v1/report`. At 1,000 sats, it's over the auto-approval limit, so you're asked first. A client that can't show MCP approval prompts gets a refusal instead.
+4. Call `l402_wallet` to see the receipts.
 
-Ctrl-C stops the network. State and logs remain in the printed temporary directory. See [demo behavior and fixture prices](docs/reference.md#local-demo-behavior) for details.
+Run `bun run down` to stop the network. The demo seller sells fixed test data: hashprice for 10 sats, break-even data for 50, and a report for 1,000.
 
-This is a trusted local application. Payment does not guarantee delivery or useful content; see [payment boundaries](docs/reference.md#payment-controls-and-boundaries).
+| Tool | What it does |
+|---|---|
+| `l402_fetch` | Fetch a URL, paying if needed. Supports GET and POST |
+| `l402_discover` | List a provider's services and prices |
+| `l402_wallet` | Show today's spending, balance, and recent receipts; resolve pending payments |
+| `l402_subscribe` | Approve recurring payments to one service (see below) |
+| `l402_subscriptions` | List or cancel subscriptions |
+
+## Configuration
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `L402_AUTO_APPROVE_SATS` | `100` | Pay without asking up to this amount |
+| `L402_DAILY_BUDGET_SATS` | `5000` | Most that can be spent or reserved per UTC day |
+| `L402_DEMO_DIR` | `.demo` | Test network directory |
+| `L402_STATE_DIR` | `$L402_DEMO_DIR/agent` | Payment database |
+
+All limits include the maximum routing fee. `bun run up` won't overwrite a non-empty `L402_DEMO_DIR`; point it at a new directory instead.
 
 ## Subscriptions
 
-A human approves a subscription once: up to a set number of sats per period, including maximum fees, to one provider's service, for a fixed number of periods. After that, the MCP wallet renews an expired credential without asking again.
+`l402_subscribe` asks you once to approve up to a set amount per period, for a fixed number of periods, to one service. After that, the agent renews an expired credential without asking.
 
-- `l402_subscribe` asks for the standing approval; `l402_subscriptions` lists or cancels subscriptions.
-- A renewal happens only after the credential's own expiry has passed. Aperture adds that expiry when a service sets `timeout`. A 402 before the expiry pays nothing.
-- At most one renewal is paid per period, and the daily budget still applies. Concurrent processes cannot both pay for one period.
-- After cancellation, the paid credential works until it expires, then nothing renews.
+- At most one renewal is paid per period, and the daily budget still applies.
+- A renewal only happens once the credential has actually expired, so a provider can't trigger extra payments.
+- After you cancel, the current credential keeps working until it expires.
 
-`bun run verify:local` includes a regtest subscription run: one prompt, two renewals, a refused second renewal within a period, and cancellation. Subscriptions apply to the MCP server, not to dashboard requests. See the [subscriptions design and limits](docs/subscriptions.md).
+On the seller side, set `timeout` (in seconds) and a fixed `price` on the [Aperture](https://github.com/lightninglabs/aperture) service. Aperture v0.5.0 ignores `timeout` for services that use `dynamicprice` or have no `price`, so their credentials never expire. This is [fixed upstream](https://github.com/lightninglabs/aperture/commit/771f371ba5dcd4f11b864b0caa4ae5c233d9cc4a) but not yet released.
 
-## Independent allowance with litd
+## A hard ceiling with litd
 
-A litd account limits spending even when the payer bypasses this application's policy. Build litd v0.17.7 and run the check:
+These limits live in this app. Anything with direct access to the wallet credentials can bypass them. For a ceiling that can't be bypassed, pay through a [litd](https://github.com/lightninglabs/lightning-terminal) account, which refuses any payment over its balance:
 
 ```sh
-bun run build:litd
-bun run verify:litd
+litcli accounts create <sats> --expiration_date <unix> --save_to <file>
+
+export L402_LND_MACAROON=<file>
+export L402_LND_RPCSERVER=127.0.0.1:8443
+export L402_LND_TLSCERT="$L402_DEMO_DIR/lit/tls.cert"
 ```
 
-On regtest, a 100-sat account rejected a 101-sat payment through litd and through lnd's own RPC port. It counted the maximum fee and held five concurrent payments to the allowance.
+litd runs in remote mode next to the buyer's lnd, which must start with `--rpcmiddleware.enable` (`L402_RPC_MIDDLEWARE=1 bun run up`). Build litd with `bun run build:litd`; `bun run verify:litd` sets all of this up and checks it. For a subscription, size the account at the per-period amount × the number of periods, and let it expire when the subscription ends.
 
-The wallet can pay through an account macaroon. Set `L402_LND_MACAROON`, `L402_LND_RPCSERVER` and `L402_LND_TLSCERT` ([configuration](docs/reference.md#pay-through-a-litd-account)). In `verify:litd`, a 40-sat account (20-sat cap × 2 periods) paid both renewals. It then refused a 50-sat purchase that a second MCP state directory approved automatically, a direct 21-sat payment, and a payment after the account expired. The account balance matched the receipts. See the [litd results](VERIFICATION.md#litd-account-subscription).
+## Wallets
 
-## Documentation
+- **lnd** (default): works only on the local test network.
+- **litd account**: as above.
+- **Wavelength** (untested with a live wallet): set `L402_WALLET=wavelength`, `WAVELENGTH_URL`, `WAVELENGTH_MACAROON_PATH`, and `WAVELENGTH_TLS_CERT`.
 
-- [Animated walkthrough](docs/README.md): all 12 steps, accounting, and recovery paths.
-- [Configuration and operations](docs/reference.md): existing networks, wallet setup, MCP tools, and stored state.
-- [Run the checks](docs/reference.md#verify): unit, browser, local Lightning, and litd allowance checks.
-- [Verification results and limitations](VERIFICATION.md): observed results and unverified behavior.
-- [Subscriptions](docs/subscriptions.md): 30-day credentials, standing approvals, renewal rules, and litd account backstops.
+## Testing
+
+```sh
+bun test                                  # unit, crash, and concurrency tests
+bun run verify:local                      # real payments on a fresh test network
+bun run build:litd && bun run verify:litd # litd account limits
+```
+
+The test-network checks use fixed ports, so run one at a time.
+
+Not tested: real Bitcoin (mainnet or signet), Wavelength with a live wallet, disk or power loss (process crashes are tested), subscription periods longer than seconds, and a litd account expiring mid-payment.
+
+## Limits
+
+- This is a local tool for one user, not a hosted service.
+- Paying doesn't guarantee a useful response.
+- Separate state directories don't share a budget.
+- Retrying a POST can run the provider's operation twice.

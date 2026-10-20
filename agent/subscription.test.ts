@@ -99,7 +99,6 @@ test("renewals must match the subscription's provider, service, node, period, an
 		[{ subscription: { id: "sub", period: 1 }, key: periodKey(sub, 1) }, "outside the current subscription period"],
 		[{ key: "https://provider.test report" }, "does not match"],
 		[{ approval: "auto" }, "does not match"],
-		[{ task_id: "task" }, "Unknown request"],
 		[{ subscription: { id: "missing", period: 0 } }, "Unknown subscription"],
 	];
 	for (const [over, error] of cases) expect(() => store.reserve(renewal(1, 0, 50, over), 100, policy, at(1))).toThrow(error);

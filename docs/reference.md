@@ -61,6 +61,15 @@ PLAYWRIGHT_MODULE=/absolute/path/to/node_modules/playwright bun run test:browser
 
 If Playwright is available through normal module resolution, omit `PLAYWRIGHT_MODULE`. `PLAYWRIGHT_CHANNEL` defaults to `chrome`. The check uses a mock wallet, exercises the browser workflow, and writes screenshots to its printed temporary directory. It does not install a browser or dependencies.
 
+To test the litd account allowance independently of the MCP policy:
+
+```sh
+bun run build:litd
+bun run verify:litd
+```
+
+It builds litd v0.17.7 without the web UI, starts a fresh network whose buyer lnd accepts RPC middleware, and runs litd in remote mode. It then sends payments directly with a 100-sat account macaroon. Port 8443 and the ports used by `up` must be free.
+
 See [verification results](../VERIFICATION.md) for measurements, the recovery matrix, and limits of the evidence.
 
 ## MCP tools

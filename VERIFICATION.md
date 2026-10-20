@@ -40,6 +40,7 @@ Telemetry retains state events and durations. Tests check that dashboard payment
 3. Run `bun run build:binaries` if `.bin` is absent.
 4. Run `bun run verify:local` for an isolated network and both smoke tests.
 5. Run `PLAYWRIGHT_MODULE=/path/to/installed/playwright bun run test:browser`. Chrome must already be installed, or select an installed channel through `PLAYWRIGHT_CHANNEL`.
+6. Run `bun run build:litd`, then `bun run verify:litd` for the litd account allowance check.
 
 `up` now refuses a nonempty state directory. The verification command creates a fresh temporary directory and keeps startup and smoke testing in the same shell. Existing `.demo` state is preserved.
 
@@ -55,6 +56,7 @@ The sandbox prevented local HTTP listeners; the suite passed when rerun with loc
 | lnd | v0.21.3-beta, commit `572b561bf05f03dfe6135110970c4d858c3482dc` |
 | Aperture | v0.5.0, commit `311220b15b04c06ecabd52c78fde8f5d6ea73c82` |
 | btcd | v0.26.2, commit `05585e037ba0690572208dbc46d121a49cc0c4c9` |
+| Lightning Terminal (litd, litcli) | v0.17.7, commit `8976aa881d427cc50c4c3b67956e7a271caa6b54`; built with `litd_no_ui` and release tags; remote mode; Go 1.27.2 |
 | Wavelength contract | `rpc/wavewalletrpc/wallet.proto` at `2c4f1ee`; no running daemon verified |
 
 The pinned [Wavelength protocol](https://github.com/lightninglabs/wavelength/blob/2c4f1ee/rpc/wavewalletrpc/wallet.proto) returns `activity.entries`, `activity.has_more`, and `activity.next_cursor` for activity listings. The previous fixture used an incorrect top-level `entries` field. Recovery now follows cursors and rejects malformed pagination.
@@ -90,19 +92,26 @@ The official [test-network guide](https://github.com/lightninglabs/wavelength/bl
 4. Restart the MCP process and repeat the fetch. Require credential reuse and an unchanged count of settled wallet payments.
 5. Repeat with a dropped response and confirm that recovery does not send again. Compare the actual wallet outflow, including swap fees, against the approved maximum.
 
-### litd allowance
+## litd account allowance
 
-Needed: a regtest litd instance with account middleware enabled, an account-restricted macaroon, seller invoice access, and a funded route. No litd binary or configured account was available for this run.
+On 2026-10-19, `bun run verify:litd` passed four consecutive runs on a fresh regtest network. litd v0.17.7 ran in remote mode against the pinned buyer lnd, started with `--rpcmiddleware.enable`. Payments used an account-restricted macaroon with `lncli payinvoice`, bypassing the MCP policy. Only litd's account interceptor could refuse them.
 
-The official [LND Accounts documentation](https://docs.lightning.engineering/lightning-network-tools/lightning-terminal/accounts) describes enforcement of account balance including fees and concurrent in-flight payments. It does not replace daily rollover or human approval.
+| Check | Observed result |
+|---|---|
+| 101 sats, fee limit 0, through litd | Rejected: `account balance insufficient`. Seller invoice `OPEN`, 0 paid; account 100 → 100; no buyer payment record. |
+| 101 sats against lnd's own RPC port | Same rejection. lnd forwarded the request to litd's interceptor without passing through litd's proxy. |
+| 95 sats, 10-sat fee limit | Rejected. The account checks the principal plus the maximum fee, not the principal alone. |
+| Five concurrent 30-sat payments, 10-sat fee limits (200 sats requested) | Two payments were held in flight by seller hold invoices; three were rejected while those two were outstanding. After settlement: two invoices `SETTLED`, three `OPEN`; 60 sats spent, 0 fees; account 100 → 40. |
+| 31 sats, 10-sat fee limit, after concurrency | Rejected; balance stayed 40. |
 
-1. Create a dedicated 100-sat account with `litcli accounts create 100 --save_to /path/to/account.macaroon`.
-2. Create a 101-sat invoice on a separate regtest node. Attempt to pay it directly with `lncli --macaroonpath=/path/to/account.macaroon`, using the account middleware's RPC endpoint and TLS configuration.
-3. Require rejection, an unpaid seller invoice, and an unchanged account balance. This bypasses the MCP policy and tests the independent enforcement boundary.
-4. Attempt concurrent payments whose combined principal and maximum fees exceed 100 sats. Reconcile account balance, pending payments, and seller invoices; require total committed spending to stay within the allowance.
+Each run gave the same result. The interceptor reserves each payment's principal plus its maximum fee, and refunds the unused fee at settlement.
+
+Source reading, not an observed race: `accounts/checkers.go` `checkSend` calls `CheckBalance` (read lock) and then `AssociatePayment` (write lock) separately. lndclient's `RegisterRPCMiddleware` handles intercepted requests one at a time on a single stream, which closes that window in practice. Five concurrent payments were tested; larger fan-out was not.
+
+The script keeps the account macaroon in the owner-only state directory and preimages in memory. It prints neither. Build litd with `bun run build:litd`. Logs from the four runs were written to session scratch files, not committed paths.
 
 ## Limits of the evidence
 
 The model assumes that a wallet honors the requested fee cap and truthfully reports terminal outcomes. It cannot prove a remote wallet's enforcement. SIGKILL tests exercise process failure, not disk loss or power-loss durability. Pending reservations can remain indefinitely when the wallet cannot establish an outcome. Separate state directories cannot coordinate spending. Rejected or expired credentials deliberately block automatic repurchase.
 
-Human comprehension testing, CPU/heap profiling, live Wavelength settlement, and litd bypass tests were not run. No new latency benchmark was run. The suite does not prove exactly-once execution of a provider's HTTP operations or guarantee delivery after payment.
+Human comprehension testing, CPU/heap profiling, and live Wavelength settlement were not run. The litd check used regtest and local test coins only. No new latency benchmark was run. The suite does not prove exactly-once execution of a provider's HTTP operations or guarantee delivery after payment.

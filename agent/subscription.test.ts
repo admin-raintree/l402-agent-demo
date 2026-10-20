@@ -186,9 +186,10 @@ async function provider(timeoutSeconds: number) {
 const until = (iso: string, extraMs = 200) => Bun.sleep(Math.max(0, Date.parse(iso) - Date.now()) + extraMs);
 
 test("MCP subscription: one prompt, lazy renewal per period, early 402 blocked, cancellation honored", async () => {
-	const f = await provider(2);
+	const f = await provider(3);
+	const sub = { url: f.url, cap_sats_per_period: 31, periods: 3, period_seconds: 6 };
 	try {
-		const { subscription } = await f.call("l402_subscribe", { url: f.url, cap_sats_per_period: 31, periods: 3, period_seconds: 4 });
+		const { subscription } = await f.call("l402_subscribe", sub);
 		expect(f.state.prompts).toBe(1);
 		const first = await f.call("l402_fetch");
 		expect(first).toMatchObject({ resource_delivered: true, payment: { approval: "standing", period: 0, amount_sat: 20, fee_sat: 1 } });
@@ -198,7 +199,7 @@ test("MCP subscription: one prompt, lazy renewal per period, early 402 blocked, 
 		f.state.reject = false;
 		await until(first.payment.valid_until);
 		expect((await f.call("l402_fetch")).reason).toContain("already renewed for period 0");
-		await until(new Date(Date.parse(subscription.starts_at) + 4000).toISOString(), 100);
+		await until(new Date(Date.parse(subscription.starts_at) + 6000).toISOString(), 100);
 		expect((await f.call("l402_fetch")).payment).toMatchObject({ approval: "standing", period: 1 });
 		expect(f.state).toMatchObject({ sends: 2, prompts: 1 });
 		const listed = await f.call("l402_subscriptions", { cancel: subscription.id });
@@ -206,10 +207,24 @@ test("MCP subscription: one prompt, lazy renewal per period, early 402 blocked, 
 		const reused = await f.call("l402_fetch");
 		expect(reused.payment).toMatchObject({ reused_paid_token: true, period: 1 });
 		await until(reused.payment.valid_until);
-		expect((await f.call("l402_fetch")).reason).toBe("subscription cancelled; no renewal");
+		expect((await f.call("l402_fetch")).reason).toMatch(/^subscription cancelled; no renewal\. Use l402_subscribe/);
 		expect(f.state).toMatchObject({ sends: 2, prompts: 1 });
+
+		// A new approval starts its own periods and pays for the lapsed credential.
+		const second = (await f.call("l402_subscribe", sub)).subscription;
+		const renewed = await f.call("l402_fetch");
+		expect(renewed.payment).toMatchObject({ approval: "standing", subscription_id: second.id, period: 0 });
+		expect(f.state).toMatchObject({ sends: 3, prompts: 2 });
+		// Re-subscribing while a paid credential is still valid reuses it instead of paying again.
+		await f.call("l402_subscriptions", { cancel: second.id });
+		const third = (await f.call("l402_subscribe", sub)).subscription;
+		const kept = await f.call("l402_fetch");
+		expect(kept.payment).toMatchObject({ reused_paid_token: true, subscription_id: second.id });
+		expect(f.state).toMatchObject({ sends: 3, prompts: 3 });
+		expect((await f.call("l402_subscriptions", {})).subscriptions.map((s: { id: string; state: string }) => [s.id, s.state]))
+			.toEqual([[third.id, "active"], [second.id, "cancelled"], [subscription.id, "cancelled"]]);
 	} finally { await f.close(); }
-}, 30_000);
+}, 40_000);
 
 test("MCP subscription: a declined approval or an inadequate cap creates nothing", async () => {
 	const f = await provider(60);

@@ -49,7 +49,7 @@ A renewal is triggered lazily, in `l402_fetch`. It happens when a request with t
 Renewal reuses [`Store.reserve`](../agent/store.ts) with two changes:
 
 1. **A key per period.** Today a purchase key is `origin service`, and any paid or pending receipt for that key blocks repayment. A renewal uses `origin service #sub-<id>/<k>` instead. Earlier periods do not block the new one, and the credential lookup picks the newest period.
-2. **Standing approval replaces the prompt, not the limits.** Inside the same `IMMEDIATE` transaction, `reserve` loads the approval. It checks that the approval is `active`, the current time falls within period *k*, and *k* is below the period count. It checks that the provider, node and service match. Settled plus pending spending for period *k*, plus the new principal and maximum fee, must fit the cap. The daily budget check (`decide`) still applies. The receipt records `approval: "standing"` and the approval ID.
+2. **Standing approval replaces the prompt, not the limits.** Inside the same `IMMEDIATE` transaction, `reserve` loads the approval. It checks that the approval is `active`, the current time falls within period *k*, and *k* is below the period count. It checks that the provider, node and service match. Node binding needs both the manifest's `node_pubkey` and a payee node in the wallet's quote. lnd supplies one; Wavelength's preview does not, so with Wavelength the node is not checked. Settled plus pending spending for period *k*, plus the new principal and maximum fee, must fit the cap. The daily budget check (`decide`) still applies. The receipt records `approval: "standing"` and the approval ID.
 
 Fee handling is unchanged. The reservation holds the principal plus the maximum fee, and settlement replaces it with the actual charge.
 
@@ -59,11 +59,11 @@ Two MCP processes can both see an expired credential at the same moment. Both re
 
 ### Renewal outcome unknown
 
-A renewal with an unknown outcome stays `pending`, as any purchase does today. It counts against the period cap and the daily budget, and reconciliation goes through `wallet.lookup`. Period *k* cannot start another renewal while one is pending. If the wallet never resolves the payment, the subscription lapses for that period instead of paying twice. If late proof arrives, the credential is stored and the period resumes. A confirmed failure releases the reservation and deletes the period's `renewals` row, so a fresh invoice can be paid.
+A renewal with an unknown outcome stays `pending`, as any purchase does today. It counts against the period cap and the daily budget, and reconciliation goes through `wallet.lookup`. Period *k* cannot start another renewal while one is pending. If the wallet never resolves the payment, the subscription lapses for that period instead of paying twice. The pending payment does not block the next period: period *k+1* can renew while period *k* is unresolved, so a late settlement can charge both periods, each within its own cap. If late proof arrives, the credential is stored and the period resumes. A confirmed failure releases the reservation and deletes the period's `renewals` row, so a fresh invoice can be paid.
 
 ### Cancellation and expiry
 
-Cancellation sets `status = cancelled` in a transaction. Because `reserve` checks the status inside its own transaction, a racing renewal is either reserved before the cancellation or refused after it. Cancellation does not recall a payment already submitted. Payments are buyer-pushed, so the seller needs no cancellation step; the current credential simply stays valid until its caveat expires. After the last period, `reserve` refuses and the subscription reports `expired`. Changing a cap or provider requires a new approval.
+Cancellation sets `status = cancelled` in a transaction. Because `reserve` checks the status inside its own transaction, a racing renewal is either reserved before the cancellation or refused after it. Cancellation does not recall a payment already submitted. Payments are buyer-pushed, so the seller needs no cancellation step; the current credential simply stays valid until its caveat expires. After the last period, `reserve` refuses and the subscription reports `expired`. Changing a cap or provider requires a new approval. A new `l402_subscribe` after cancellation or expiry starts fresh periods. It reuses any credential still valid from an earlier subscription to the same service, rather than paying again.
 
 ## What each layer enforces
 

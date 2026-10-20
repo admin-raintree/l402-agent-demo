@@ -139,7 +139,7 @@ try {
 	assert.equal(reused.payment.reused_paid_token, true);
 	await until(reused.payment.valid_until);
 	const stopped = await call("l402_fetch");
-	assert.equal(stopped.reason, "subscription cancelled; no renewal");
+	assert.match(stopped.reason, /^subscription cancelled; no renewal/);
 	console.log(`  ${stopped.reason}`);
 
 	step("8. Reconcile receipts with independent buyer and seller records");

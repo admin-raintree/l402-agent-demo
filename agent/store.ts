@@ -138,6 +138,13 @@ export class Store {
 			if (token) return { token, period: k };
 		}
 	}
+	/** Newest credential bought under any subscription to this service, so re-subscribing never pays for access already held. */
+	serviceCredential(origin: string, service: string): { token: string; period: number; subscriptionId: string } | undefined {
+		for (const s of this.subscriptions().filter(s => s.origin === origin && s.service === service)) {
+			const held = this.subscriptionToken(s);
+			if (held) return { ...held, subscriptionId: s.id };
+		}
+	}
 	periodSpent(id: string, period: number) {
 		return this.purchases().filter(p => p.subscription?.id === id && p.subscription.period === period &&
 			(p.outcome === "paid" || p.outcome === "pending")).reduce((n, p) => n + p.amount_sat + p.fee_sat, 0);

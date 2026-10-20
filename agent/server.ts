@@ -148,7 +148,8 @@ server.registerTool(
 		description:
 			"Make an HTTP request, paying any L402 Lightning challenge from the agent wallet and reusing a paid token when one exists. " +
 			`Payments up to ${policy.autoApproveSats} sats are automatic; larger ones ask the human; anything over max_sats or the ` +
-			`${policy.dailyBudgetSats}-sat daily budget is refused. All limits include maximum routing fees. Set max_sats to the most this one call may cost.`,
+			`${policy.dailyBudgetSats}-sat daily budget is refused. All limits include maximum routing fees. Set max_sats to the most this one call may cost. ` +
+			"With an l402_subscribe approval for the service, an expired credential renews once per period without asking.",
 		inputSchema: {
 			url: z.string().url(),
 			max_sats: z.number().int().positive().describe("Most this call may spend, in sats"),
@@ -184,10 +185,10 @@ server.registerTool(
 		let standing: { sub: Subscription; period: number } | undefined;
 		if (sub) {
 			const now = new Date();
-			const held = store.subscriptionToken(sub);
+			const held = store.serviceCredential(sub.origin, sub.service);
 			if (held) {
 				const validUntil = credentialExpiry(held.token);
-				const reuse = { amount_sat: 0, reused_paid_token: true, subscription_id: sub.id, period: held.period,
+				const reuse = { amount_sat: 0, reused_paid_token: true, subscription_id: held.subscriptionId, period: held.period,
 					valid_until: validUntil ? new Date(validUntil * 1000).toISOString() : null };
 				let res: Response;
 				try { res = await call(held.token); }
@@ -203,11 +204,12 @@ server.registerTool(
 			}
 			const state = subscriptionState(sub, now);
 			if (state !== "active")
-				return json({ status: 402, paid: false, outcome: "refused", subscription_id: sub.id, reason: `subscription ${state}; no renewal` });
+				return json({ status: 402, paid: false, outcome: "refused", subscription_id: sub.id,
+					reason: `subscription ${state}; no renewal${state === "scheduled" ? "" : ". Use l402_subscribe to approve a new subscription"}` });
 			const period = periodAt(sub, now)!;
 			key = periodKey(sub, period);
 			const existing = store.forKey(key);
-			if (existing?.outcome === "paid" && held?.period === period)
+			if (existing?.outcome === "paid" && held?.subscriptionId === sub.id && held.period === period)
 				return json({ status: 402, paid: false, outcome: "refused", subscription_id: sub.id,
 					reason: `already renewed for period ${period}; the next renewal can start at ${periodStart(sub, period + 1).toISOString()}` });
 			if (existing) return paymentState(existing);
@@ -307,7 +309,8 @@ server.registerTool(
 		const url = new URL(href);
 		const manifest = await discover(url.origin);
 		const service = serviceFor(url);
-		const resource = manifest.services.find(s => s.name === service)?.resources[0];
+		const resource = manifest.services.find(s => s.name === service)?.resources
+			.find(r => url.pathname === r.path || url.pathname.startsWith(r.path + "/"));
 		if (!resource) throw new Error("the provider's manifest does not list this resource");
 		const existing = store.subscriptionFor(url.origin, service);
 		if (existing && ["active", "scheduled"].includes(subscriptionState(existing, new Date())))

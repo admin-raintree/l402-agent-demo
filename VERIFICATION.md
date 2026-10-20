@@ -152,10 +152,34 @@ Observed in a manual probe on the same versions, not asserted by the script: `li
 Inferred, not tested:
 
 - The 20 sats left in the account are the unused fee reserve. Any holder of the macaroon could spend them on any invoice until expiry. A payment that fit them was not attempted.
-- The wallet's `listpayments` lookup stops at the first empty page. Through litd it could report `unknown` for an account payment behind more than 100 payments from other macaroons.
+- The wallet's `listpayments` lookup stopped at the first empty page. Through litd it could report `unknown` for an account payment behind more than 100 payments from other macaroons. Fixed on 2026-10-20; see [below](#litd-refusals-and-pagination).
 - After expiry, reconciliation through `listpayments` is probably refused too, like `channelbalance`.
 
-The application records a litd refusal as an unresolved payment, not a failure. It keeps the reservation and blocks retries, as for a lost response. This is safe but needs manual cleanup. The account macaroon stays in the owner-only state directory. Logs were scanned for macaroon and preimage values; none were found.
+In these runs the application recorded a litd refusal as an unresolved payment, not a failure. It kept the reservation and blocked retries, as for a lost response. This was safe but needed manual cleanup. The over-balance case changed on 2026-10-20; see [below](#litd-refusals-and-pagination). The account macaroon stays in the owner-only state directory. Logs were scanned for macaroon and preimage values; none were found.
+
+## litd refusals and pagination
+
+On 2026-10-20, `lndWallet.pay` was changed to throw `PaymentFailed` when lncli reports litd's `account balance insufficient`. `lndWallet.lookup` was changed to keep paging through empty `listpayments` pages while `last_index_offset` advances.
+
+Source check, litd v0.17.7 and lnd v0.21.3:
+
+- `account balance insufficient` comes only from the `SendPaymentV2` and `SendToRouteV2` request checkers (`checkSend`, `checkSendToRoute` and `CheckBalance` in `accounts/checkers.go` and `accounts/service.go`). A rejected request never reaches lnd, so no HTLC is sent.
+- `account <id> has expired` comes from `accounts/interceptor.go:112`, which runs for every intercepted message. lnd's `rpcperms` `serverStreamWrapper.SendMsg` passes each streamed `SendPaymentV2` update through the interceptor. An account that expires during a payment can therefore produce this error after HTLCs were sent. That refusal stays a pending reservation.
+- lnd sets `last_index_offset` only when its unfiltered page holds payments; otherwise it is 0. litd's `filterPayments` removes other macaroons' payments without changing the offsets.
+
+Checks run:
+
+- `bun test`: 77 tests passed in 119.09 s. That is the previous 72 plus 5 in `agent/lnd-wallet.test.ts`, which use a scripted fake lncli. They cover the over-balance refusal (`PaymentFailed`), the expiry and transport errors (not `PaymentFailed`), paging past empty filtered pages, stopping at lnd's empty last page, and the existing pagination guard. Against the previous wallet code, 3 of the 5 failed.
+- `bun run verify:litd`: passed once on a fresh regtest network, including the allowance check and the subscription smoke.
+
+| Check | Observed result |
+|---|---|
+| Second MCP state directory, 50 sats over a 20-sat balance | MCP result `failed` ("wallet confirmed payment failure"), 0 sats reserved. Seller invoice `OPEN`, no buyer payment record, account unchanged at 20. |
+| Same `lndWallet.pay` call on a fresh 50-sat invoice | `PaymentFailed`: `error validating account balance: account balance insufficient`. |
+| Direct lncli, 11 sats + 10-sat fee limit; after expiry, 5 sats | Unchanged: `account balance insufficient`, then `account <id> has expired`. |
+| Reconciliation | Account 40 → 20, matching the two receipts; both payments `SUCCEEDED` and `SETTLED`. |
+
+Not covered live: an expiry during an in-flight payment, and a lookup behind more than 100 non-account payments. The paging fix is tested only against the fake lncli. The run log contained no macaroon hex and no 64-character hex values.
 
 ## Limits of the evidence
 

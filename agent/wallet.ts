@@ -61,7 +61,16 @@ export function lndWallet(root: string, demo: string, env: Record<string, string
 			return { amountSat: Math.ceil(Number(d.num_msat) / 1000), paymentHash: d.payment_hash, destination: d.destination };
 		},
 		async pay(invoice, _quote, feeLimitSat) {
-			const out = await lncli("payinvoice", "--force", "--json", `--fee_limit=${feeLimitSat}`, invoice);
+			let out: string;
+			try {
+				out = await lncli("payinvoice", "--force", "--json", `--fee_limit=${feeLimitSat}`, invoice);
+			} catch (e) {
+				// litd's account checker rejects an over-balance SendPaymentV2 request before lnd runs it, so
+				// no HTLC left. litd's "account <id> has expired" stays unresolved: litd also checks expiry on
+				// each streamed payment update, so that error can arrive after HTLCs were sent.
+				if (/account balance insufficient/.test(String(e))) throw new PaymentFailed(`payment refused: ${(e as Error).message}`);
+				throw e;
+			}
 			const status = [...out.matchAll(/"status":\s*"(\w+)"/g)].at(-1)?.[1];
 			const preimage = out.match(/"payment_preimage":\s*"([0-9a-f]{64})"/)?.[1];
 			if (status !== "SUCCEEDED" || !preimage) throw new Error(`payment did not succeed (status ${status ?? "unknown"})`);
@@ -75,9 +84,14 @@ export function lndWallet(root: string, demo: string, env: Record<string, string
 				if (p?.status === "SUCCEEDED") return { state: "paid", result: { feeSat: Number(p.fee_sat), preimage: p.payment_preimage } };
 				if (p?.status === "FAILED") return { state: "failed" };
 				if (p) return { state: "pending" };
-				if (!page.payments?.length) return { state: "unknown" };
-				const next = String(page.last_index_offset);
-				if (!/^\d+$/.test(next) || BigInt(next) <= BigInt(offset)) throw new Error("invalid lnd payment pagination");
+				// Through litd, a page keeps lnd's unfiltered offsets but only this account's payments, so an
+				// empty page can still advance; lnd itself returns offset 0 once no payments remain.
+				const next = String(page.last_index_offset ?? "0");
+				if (!/^\d+$/.test(next)) throw new Error("invalid lnd payment pagination");
+				if (BigInt(next) <= BigInt(offset)) {
+					if (!page.payments?.length) return { state: "unknown" };
+					throw new Error("invalid lnd payment pagination");
+				}
 				offset = next;
 			}
 		},

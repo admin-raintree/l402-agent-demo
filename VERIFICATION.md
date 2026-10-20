@@ -98,7 +98,7 @@ On 2026-10-19, `bun test` passed 67 tests in 134.53 seconds: the original 58 plu
 
 | Check | Observed result | Boundary |
 |---|---|---|
-| Aperture `timeout` caveat | `timeout: 4` minted `hashprice_valid_until` at mint time plus 4 s; the service without a timeout had no expiry caveat; Aperture answered the expired credential with a fresh 402 | Live regtest Aperture v0.5.0, static pricing. Dynamic pricing not tested. |
+| Aperture `timeout` caveat | `timeout: 4` minted `hashprice_valid_until` at mint time plus 4 s; the service without a timeout had no expiry caveat; Aperture answered the expired credential with a fresh 402 | Live regtest Aperture v0.5.0, explicit static price. With `dynamicprice` or no `price`, v0.5.0 omits the caveat; see below. |
 | Standing approval | One prompt at subscription time with auto-approval at 0; two renewals paid without prompts; receipts record `approval: "standing"` | Regtest; 20 sats per 12-second period. |
 | One renewal per period | Expired credential inside period 0 refused; renewal paid at the start of period 1. Eight racing processes produced one reservation for one period | Live regtest plus local SQLite. |
 | Cancellation and expiry | After cancel, the paid credential kept working until its expiry, then no renewal. Expired and scheduled states refuse | Live regtest plus unit tests. |
@@ -107,6 +107,38 @@ On 2026-10-19, `bun test` passed 67 tests in 134.53 seconds: the original 58 plu
 | Reconciliation | Both renewals settled; preimages hash to payment hashes; fees and seller invoices match receipts | Live regtest. |
 
 Not covered: dashboard requests with subscriptions, manifest subscription terms, paying through a litd account macaroon, and real 30-day periods. Timing tests use second-scale periods.
+
+## Aperture dynamicprice and the timeout caveat
+
+Confirmed on 2026-10-19: Aperture v0.5.0 (`311220b`) omits `<service>_valid_until`, `<service>_capabilities` and constraint caveats for a service that uses `dynamicprice`, and for a static service with no `price`. Upstream master fixed this in [`771f371`](https://github.com/lightninglabs/aperture/commit/771f371ba5dcd4f11b864b0caa4ae5c233d9cc4a), authored 2026-09-24 and landed on master 2026-10-06. No tag contains the fix; v0.5.0 is still the latest.
+
+Source: the limiter's `capabilities`, `constraints` and `timeouts` maps all use the same key, `l402.Service{Name, BaseTier, configured Price}` ([`services.go:35-39`](https://github.com/lightninglabs/aperture/blob/v0.5.0/services.go#L35-L39)). A lookup that misses is skipped without a log message. Dynamic challenges use the name `<service><path>` and the price the pricer quotes. The limiter is built in `createProxy` before `prepareServices` sets the default price of 1.
+
+Live regtest check, on separate ports from `scripts/up.sh`: btcd, one lnd, a static HTTP backend, a stub `pricesrpc` server returning 25 sats ([`docs/upstream/stubpricer.go`](docs/upstream/stubpricer.go)), and Aperture with four services. Each service had `timeout: 3600`, `capabilities: "read"` and one constraint. Each challenge macaroon was decoded with `macaroonCaveats` from `agent/subscription.ts`. Only caveat names and the expiry offset were printed, never the macaroon.
+
+| Service | Config | v0.5.0 caveats | master `08c10f5` caveats |
+|---|---|---|---|
+| `stat` | `price: 10` | `services`, `stat_capabilities`, `stat_region`, `stat_valid_until=now+3600s` | same |
+| `nopr` | no `price` (invoice 1 sat) | `services` only | all four, `nopr_valid_until=now+3600s` |
+| `dyn` | `dynamicprice`, no `price` (invoice 25 sat) | `services` only | all four, `dyn/dyn/v1/x_valid_until=now+3600s` |
+| `dynp` | `dynamicprice`, `price: 25`, equal to the quote | `services` only | all four, `dynp/dynp/v1/x_valid_until=now+3600s` |
+
+`dynp` shows that the request-path name alone breaks the lookup, even when the prices match.
+
+Unit test: `services_price_test.go` mints through `mint.New` and `newStaticServiceLimiter`. It was run in a scratch clone, so the pinned checkout stayed clean (`git status` empty). Result on v0.5.0: 4 of 5 cases fail, and only the explicit static price passes. Result on master and on v0.5.0 with [`docs/upstream/aperture-v0.5.0-limiter-key.patch`](docs/upstream/aperture-v0.5.0-limiter-key.patch): all pass.
+
+```bash
+git clone ~/Code/scratch/lightning-builds/aperture /tmp/aperture-check && cd /tmp/aperture-check
+git checkout 311220b15b04c06ecabd52c78fde8f5d6ea73c82
+git apply --include=services_price_test.go /path/to/aperture-v0.5.0-limiter-key.patch
+go test -run TestLimiterCaveatsWhenMintPriceDiffers -v .   # fails on v0.5.0
+git apply --include=services.go /path/to/aperture-v0.5.0-limiter-key.patch
+go test -run 'TestLimiterCaveats|TestServiceTimeouts|TestStaticServiceLimiter' -v .   # passes
+```
+
+With the patch, `go test . ./mint/ ./l402/` passed. `./proxy/` failed because its tests bind `localhost:10019`, which another regtest lnd held at the time. The patch does not touch that package. A draft upstream request for a release is in [`docs/upstream/aperture-issue-draft.md`](docs/upstream/aperture-issue-draft.md). It has not been filed.
+
+Inferred, not tested: a v0.5.0 credential without these caveats also skips the capability and constraint checks that rely on them. Repricing a service through the admin API also breaks the lookup, because the limiter is not rebuilt; 771f371's commit message reports this too.
 
 ## litd account allowance
 

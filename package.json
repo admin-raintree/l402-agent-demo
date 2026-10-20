@@ -5,12 +5,14 @@
   "type": "module",
   "scripts": {
     "build:binaries": "scripts/build-binaries.sh",
+    "build:litd": "scripts/build-litd.sh",
     "up": "scripts/up.sh",
     "down": "scripts/down.sh",
     "test": "bun test",
     "smoke": "bun scripts/smoke.ts",
     "dashboard": "bun dashboard/server.ts",
     "verify:local": "bash scripts/verify-local.sh",
+    "verify:litd": "bash scripts/verify-litd.sh",
     "test:browser": "bun scripts/browser-check.ts",
     "demo": "bash scripts/demo.sh"
   },

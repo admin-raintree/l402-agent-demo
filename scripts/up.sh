@@ -36,10 +36,13 @@ mine() { ctl generate "$1"; }
 
 # name rpc-port p2p-port
 lnd_start() {
+  # L402_RPC_MIDDLEWARE=1 lets litd attach its account interceptor to the buyer node.
+  local extra=()
+  [ "$1" = buyer ] && [ "${L402_RPC_MIDDLEWARE:-}" = 1 ] && extra+=(--rpcmiddleware.enable)
   lnd --lnddir="$D/$1" --bitcoin.regtest --bitcoin.node=btcd \
     --btcd.rpchost=127.0.0.1:18556 --btcd.rpcuser=demo --btcd.rpcpass=demo --btcd.rpccert="$D/btcd/rpc.cert" \
     --noseedbackup --norest --rpclisten="127.0.0.1:$2" --listen="127.0.0.1:$3" \
-    --alias="$1" --trickledelay=50 --nobootstrap >"$D/logs/$1.log" 2>&1 &
+    --alias="$1" --trickledelay=50 --nobootstrap ${extra[@]+"${extra[@]}"} >"$D/logs/$1.log" 2>&1 &
   echo $! >"$D/$1.pid"
 }
 cli() { local n=$1 port=$2; shift 2; lncli --lnddir="$D/$n" --network=regtest --rpcserver="127.0.0.1:$port" "$@"; }

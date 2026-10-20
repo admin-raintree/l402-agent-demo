@@ -60,3 +60,4 @@ This is a trusted local application. Payment does not guarantee delivery or usef
 - [Configuration and operations](docs/reference.md): existing networks, wallet setup, MCP tools, and stored state.
 - [Run the checks](docs/reference.md#verify): unit, browser, and local Lightning checks.
 - [Verification results and limitations](VERIFICATION.md): observed results and unverified behavior.
+- [Subscriptions](docs/subscriptions.md): 30-day credentials, standing approvals, renewal rules, and litd account backstops.

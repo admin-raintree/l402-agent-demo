@@ -1,6 +1,7 @@
 // MCP server that gives an agent a Lightning wallet (lnd or Wavelength) with a spending policy.
 // It discovers L402 services, pays their challenges, reuses paid tokens, asks a
 // human (MCP elicitation) above a threshold, and keeps a receipt for every decision.
+import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -8,6 +9,7 @@ import { z } from "zod";
 import { decide, parseChallenge, type Receipt, spentToday } from "./policy";
 import { PaymentFailed, walletFromEnv } from "./wallet";
 import { Store, type Purchase } from "./store";
+import { credentialExpiry, periodAt, periodKey, periodStart, subscriptionState, type Subscription } from "./subscription";
 
 const ROOT = resolve(import.meta.dir, "..");
 const DEMO = process.env.L402_DEMO_DIR ?? resolve(ROOT, ".demo");
@@ -146,7 +148,8 @@ server.registerTool(
 		description:
 			"Make an HTTP request, paying any L402 Lightning challenge from the agent wallet and reusing a paid token when one exists. " +
 			`Payments up to ${policy.autoApproveSats} sats are automatic; larger ones ask the human; anything over max_sats or the ` +
-			`${policy.dailyBudgetSats}-sat daily budget is refused. All limits include maximum routing fees. Set max_sats to the most this one call may cost.`,
+			`${policy.dailyBudgetSats}-sat daily budget is refused. All limits include maximum routing fees. Set max_sats to the most this one call may cost. ` +
+			"With an l402_subscribe approval for the service, an expired credential renews once per period without asking.",
 		inputSchema: {
 			url: z.string().url(),
 			max_sats: z.number().int().positive().describe("Most this call may spend, in sats"),
@@ -161,7 +164,7 @@ server.registerTool(
 		if (!["https:", "http:"].includes(url.protocol) || url.username || url.password) throw new Error("invalid provider URL");
 		if (!manifests.has(url.origin)) await discover(url.origin).catch(() => undefined);
 		const service = serviceFor(url);
-		const key = `${url.origin} ${service}`;
+		let key = `${url.origin} ${service}`;
 		await reconcile();
 		const call = (authorization?: string) =>
 			fetch(url, { method, body, redirect: "error", headers: authorization ? { authorization } : {}, signal: AbortSignal.timeout(15_000) });
@@ -176,12 +179,49 @@ server.registerTool(
 					reason: "resource response unavailable; delivery is unknown; automatic repayment blocked" });
 			}
 		};
-		const token = store.token(key);
-		if (token) return deliver(token, { amount_sat: 0, reused_paid_token: true, payment_hash: store.forKey(key)?.payment_hash });
-		const existing = store.forKey(key);
-		if (existing) return paymentState(existing);
+		// Subscriptions apply to the unbound MCP server; dashboard requests keep their own budgets.
+		const sub = taskId ? undefined : store.subscriptionFor(url.origin, service);
+		let first: Response | undefined;
+		let standing: { sub: Subscription; period: number } | undefined;
+		if (sub) {
+			const now = new Date();
+			const held = store.serviceCredential(sub.origin, sub.service);
+			if (held) {
+				const validUntil = credentialExpiry(held.token);
+				const reuse = { amount_sat: 0, reused_paid_token: true, subscription_id: held.subscriptionId, period: held.period,
+					valid_until: validUntil ? new Date(validUntil * 1000).toISOString() : null };
+				let res: Response;
+				try { res = await call(held.token); }
+				catch { return json({ paid: true, proof_of_payment: true, resource_delivered: false, payment: reuse,
+					reason: "resource response unavailable; delivery is unknown; automatic repayment blocked" }); }
+				if (res.status !== 402) return json({ status: res.status, paid: true, proof_of_payment: true, resource_delivered: res.ok,
+					payment: reuse, body: await readBody(res), ...(!res.ok ? { reason: "paid credential did not deliver the resource" } : {}) });
+				// Only a lapse the credential itself proves can trigger a renewal; an early 402 is a rejection.
+				if (validUntil === undefined || now.getTime() < validUntil * 1000)
+					return json({ status: 402, paid: true, resource_delivered: false, payment: reuse,
+						reason: "subscription credential rejected before its expiry; automatic repayment blocked" });
+				first = res;
+			}
+			const state = subscriptionState(sub, now);
+			if (state !== "active")
+				return json({ status: 402, paid: false, outcome: "refused", subscription_id: sub.id,
+					reason: `subscription ${state}; no renewal${state === "scheduled" ? "" : ". Use l402_subscribe to approve a new subscription"}` });
+			const period = periodAt(sub, now)!;
+			key = periodKey(sub, period);
+			const existing = store.forKey(key);
+			if (existing?.outcome === "paid" && held?.subscriptionId === sub.id && held.period === period)
+				return json({ status: 402, paid: false, outcome: "refused", subscription_id: sub.id,
+					reason: `already renewed for period ${period}; the next renewal can start at ${periodStart(sub, period + 1).toISOString()}` });
+			if (existing) return paymentState(existing);
+			standing = { sub, period };
+		} else {
+			const token = store.token(key);
+			if (token) return deliver(token, { amount_sat: 0, reused_paid_token: true, payment_hash: store.forKey(key)?.payment_hash });
+			const existing = store.forKey(key);
+			if (existing) return paymentState(existing);
+		}
 
-		const first = await call();
+		first ??= await call();
 		if (first.status !== 402) return json({ status: first.status, payment: null, body: await readBody(first) });
 		const challenge = parseChallenge(first.headers.get("www-authenticate"));
 		if (!challenge) return json({ status: 402, paid: false, error: "402 response without an L402 challenge" });
@@ -190,20 +230,21 @@ server.registerTool(
 		const base = { task_id: taskId, ts: new Date().toISOString(), url: url.href, service, wallet: wallet.name,
 			amount_sat: quote.amountSat, fee_sat: 0, payment_hash: quote.paymentHash };
 		const stop = (outcome: "declined" | "refused", reason: string, approval: Receipt["approval"] = "none") => {
-			store.record({ ...base, approval, outcome, reason });
+			store.record({ ...base, approval, outcome, reason, subscription_id: standing?.sub.id });
 			return json({ status: 402, paid: false, outcome, reason, price_sats: base.amount_sat });
 		};
-		const expectedNode = manifests.get(url.origin)?.provider?.node_pubkey;
+		const expectedNode = standing?.sub.nodePubkey ?? manifests.get(url.origin)?.provider?.node_pubkey;
 		if (expectedNode && quote.destination && quote.destination !== expectedNode)
 			return stop("refused", "invoice pays a different node than the provider's manifest names");
+		const maxSats = standing ? Math.min(max_sats, standing.sub.capSat) : max_sats;
 		const spent = spentToday(store.ledger());
 		let task;
 		try { if (taskId) task = store.checkTask(taskId, url.href, base.amount_sat, FEE_LIMIT_SATS); }
 		catch (e) { return stop("refused", e instanceof Error ? e.message : "Task refused purchase"); }
-		const decision = decide(base.amount_sat, max_sats, spent,
+		const decision = decide(base.amount_sat, maxSats, spent,
 			{ ...policy, autoApproveSats: Math.min(policy.autoApproveSats, task?.autoApproveSat ?? Infinity) }, FEE_LIMIT_SATS);
 		if (decision.kind === "refuse") return stop("refused", decision.reason);
-		if (decision.kind === "ask") {
+		if (decision.kind === "ask" && !standing) {
 			let denied: string | undefined;
 			try {
 				denied = await askHuman(`Approve ${base.amount_sat} sats plus up to ${FEE_LIMIT_SATS} sats in fees for ${method} ${url.href} (${service})? ` +
@@ -211,9 +252,10 @@ server.registerTool(
 			} catch { denied = "approval unavailable or disconnected"; }
 			if (denied) return stop("declined", denied, "human");
 		}
-		const purchase: Purchase = { ...base, approval: decision.kind === "ask" ? "human" : "auto", outcome: "pending",
-			key, macaroon: challenge.macaroon, quote, fee_limit_sat: FEE_LIMIT_SATS };
-		try { store.reserve(purchase, max_sats, policy); }
+		const purchase: Purchase = { ...base, approval: standing ? "standing" : decision.kind === "ask" ? "human" : "auto", outcome: "pending",
+			key, macaroon: challenge.macaroon, quote, fee_limit_sat: FEE_LIMIT_SATS,
+			...(standing ? { subscription: { id: standing.sub.id, period: standing.period } } : {}) };
+		try { store.reserve(purchase, maxSats, policy); }
 		catch (e) { return stop("refused", e instanceof Error ? e.message : "reservation failed"); }
 		try {
 			const result = await wallet.pay(challenge.invoice, quote, FEE_LIMIT_SATS);
@@ -228,7 +270,84 @@ server.registerTool(
 		if (!credential) return paymentState(settled);
 		return deliver(credential, { wallet: wallet.name, amount_sat: settled.amount_sat, fee_sat: settled.fee_sat,
 			approval: settled.approval, payment_hash: settled.payment_hash,
+			...(standing ? { subscription_id: standing.sub.id, period: standing.period,
+				valid_until: (v => v ? new Date(v * 1000).toISOString() : null)(credentialExpiry(credential)) } : {}),
 			spent_today_sat: spentToday(store.ledger()), daily_budget_sat: policy.dailyBudgetSats });
+	}),
+);
+
+function describeSubscription(sub: Subscription, now = new Date()) {
+	const period = periodAt(sub, now);
+	const held = store.subscriptionToken(sub);
+	const validUntil = held && credentialExpiry(held.token);
+	return { id: sub.id, origin: sub.origin, service: sub.service, node_pubkey: sub.nodePubkey ?? null,
+		cap_sats_per_period: sub.capSat, period_seconds: sub.periodSeconds, periods: sub.periods,
+		starts_at: sub.startsAt, ends_at: periodStart(sub, sub.periods).toISOString(), state: subscriptionState(sub, now),
+		current_period: period ?? null, current_period_spent_sat: period === undefined ? 0 : store.periodSpent(sub.id, period),
+		credential_period: held?.period ?? null, credential_valid_until: validUntil ? new Date(validUntil * 1000).toISOString() : null,
+		cancelled_at: sub.cancelledAt ?? null };
+}
+
+server.registerTool(
+	"l402_subscribe",
+	{
+		title: "Approve a subscription",
+		description:
+			"Ask the human once for a standing approval: up to cap_sats_per_period (including maximum routing fees) per period " +
+			"to one provider's service, for a fixed number of periods. Later l402_fetch calls renew an expired credential within " +
+			"that approval without prompting. At most one renewal is paid per period; the daily budget still applies.",
+		inputSchema: {
+			url: z.string().url().describe("A resource URL on the provider; its service is subscribed"),
+			cap_sats_per_period: z.number().int().positive().describe("Most one period may cost, including maximum fees"),
+			periods: z.number().int().min(1).max(120).describe("Number of periods the approval covers"),
+			period_seconds: z.number().int().min(1).max(31_536_000).default(2_592_000).describe("Period length; defaults to 30 days"),
+		},
+		annotations: { readOnlyHint: false, openWorldHint: true },
+	},
+	async ({ url: href, cap_sats_per_period, periods, period_seconds }) => serialized(async () => {
+		if (taskId) throw new Error("request-bound MCP processes cannot create subscriptions");
+		const url = new URL(href);
+		const manifest = await discover(url.origin);
+		const service = serviceFor(url);
+		const resource = manifest.services.find(s => s.name === service)?.resources
+			.find(r => url.pathname === r.path || url.pathname.startsWith(r.path + "/"));
+		if (!resource) throw new Error("the provider's manifest does not list this resource");
+		const existing = store.subscriptionFor(url.origin, service);
+		if (existing && ["active", "scheduled"].includes(subscriptionState(existing, new Date())))
+			throw new Error(`subscription ${existing.id} already covers this service; cancel it first`);
+		if (cap_sats_per_period > policy.dailyBudgetSats)
+			throw new Error(`a ${cap_sats_per_period}-sat renewal could never fit the ${policy.dailyBudgetSats}-sat daily budget`);
+		const price = resource.pricing.model === "fixed" && resource.pricing.price_msat !== undefined ? Math.ceil(resource.pricing.price_msat / 1000) : undefined;
+		if (price !== undefined && price + FEE_LIMIT_SATS > cap_sats_per_period)
+			throw new Error(`advertised price ${price} sats plus ${FEE_LIMIT_SATS} sats maximum fees exceeds the cap`);
+		const every = period_seconds % 86_400 ? `${period_seconds} seconds` : `${period_seconds / 86_400} days`;
+		let denied: string | undefined;
+		try {
+			denied = await askHuman(`Approve a subscription to ${service} at ${url.origin}: up to ${cap_sats_per_period} sats (including fees) ` +
+				`every ${every} for ${periods} periods, at most ${cap_sats_per_period * periods} sats in total? ` +
+				`Advertised price: ${price ?? "unknown"} sats. Renewals will not ask again; you can cancel at any time.`);
+		} catch { denied = "approval unavailable or disconnected"; }
+		if (denied) return json({ subscribed: false, reason: denied });
+		const now = new Date();
+		const sub: Subscription = { id: randomUUID(), origin: url.origin, service, nodePubkey: manifest.provider?.node_pubkey,
+			capSat: cap_sats_per_period, periodSeconds: period_seconds, periods, startsAt: now.toISOString(), createdAt: now.toISOString(), status: "active" };
+		store.createSubscription(sub);
+		return json({ subscribed: true, subscription: describeSubscription(sub, now) });
+	}),
+);
+
+server.registerTool(
+	"l402_subscriptions",
+	{
+		title: "List or cancel subscriptions",
+		description: "List standing approvals with their current period, spend, and credential expiry. Pass cancel to stop future renewals; " +
+			"a credential already paid for stays usable until it expires.",
+		inputSchema: { cancel: z.string().uuid().optional().describe("Subscription id to cancel") },
+		annotations: { readOnlyHint: false },
+	},
+	async ({ cancel }) => serialized(async () => {
+		if (cancel) store.cancelSubscription(cancel);
+		return json({ subscriptions: store.subscriptions().map(s => describeSubscription(s)) });
 	}),
 );
 

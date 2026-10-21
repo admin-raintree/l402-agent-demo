@@ -6,12 +6,14 @@
   "scripts": {
     "build:binaries": "scripts/build-binaries.sh",
     "build:litd": "scripts/build-litd.sh",
+    "build:wavelength": "bash scripts/build-wavelength.sh",
     "up": "scripts/up.sh",
     "down": "scripts/down.sh",
     "test": "bun test",
     "smoke": "bun scripts/smoke.ts",
     "verify:local": "bash scripts/verify-local.sh",
-    "verify:litd": "bash scripts/verify-litd.sh"
+    "verify:litd": "bash scripts/verify-litd.sh",
+    "verify:wavelength": "bun scripts/verify-wavelength.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",

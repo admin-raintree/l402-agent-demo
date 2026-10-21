@@ -1,0 +1,99 @@
+diff --git a/oor/session_actor.go b/oor/session_actor.go
+index 99bd2fa..dc851ad 100644
+--- a/oor/session_actor.go
++++ b/oor/session_actor.go
+@@ -836,7 +836,7 @@ func (b *sessionBehavior) driveOutboxEvents(ctx context.Context,
+ 		// arrives as a fresh DriveEventRequest turn. commitAck enqueues
+ 		// these.
+ 		case *SendSubmitPackageRequest, *SendFinalizePackageRequest,
+-			*SendIncomingAckRequest, *QueryIncomingTransferRequest,
++			*QueryIncomingTransferRequest,
+ 			*QueryIncomingMetadataRequest:
+ 
+ 			transport, err := b.buildTransportMessage(ctx, event)
+@@ -855,15 +855,15 @@ func (b *sessionBehavior) driveOutboxEvents(ctx context.Context,
+ 				btclog.Fmt("transport_type", "%T", event),
+ 			)
+ 
+-			// SendIncomingAckRequest has no operator response;
+-			// advance the receive FSM to completion in the same
+-			// turn.
+-			if _, ok := m.(*SendIncomingAckRequest); ok {
+-				if err := b.continueWith(
+-					ctx, &IncomingAckSentEvent{},
+-				); err != nil {
+-					return err
+-				}
++		case *SendIncomingAckRequest:
++			// IncomingAck has no wire RPC. Its custom Any contains
++			// persistence TLV, not a protobuf message. Materialization
++			// is already durable; complete the local receive without
++			// enqueuing an undecodable event to serverconn.
++			if err := b.continueWith(
++				ctx, &IncomingAckSentEvent{},
++			); err != nil {
++				return err
+ 			}
+ 
+ 		// Input-spend completion: run the spend inline in dispatch,
+diff --git a/oor/session_actor_flow_test.go b/oor/session_actor_flow_test.go
+index 68b0264..097faf3 100644
+--- a/oor/session_actor_flow_test.go
++++ b/oor/session_actor_flow_test.go
+@@ -221,17 +221,15 @@ func TestSessionActorIncomingMaterializeFullFlow(t *testing.T) {
+ 	}, ax)
+ 	require.True(t, res.IsOk(), res.Err())
+ 
+-	// The FSM completed and the commit carried the ack transport plus the
+-	// terminal snapshot.
++	// The FSM completed and the commit carried the terminal snapshot.
+ 	state, err := b.fsm.CurrentState()
+ 	require.NoError(t, err)
+ 	require.IsType(t, &ReceiveCompleted{}, state)
+ 	require.True(t, b.terminalCommitted)
+ 
+-	// The ack transport was Tell'd directly into the serverconn durable
+-	// actor during the commit (no generic outbox enqueue).
++	// IncomingAck is local until the protocol defines an ack RPC.
+ 	require.Empty(t, delivery.enqueued)
+-	require.Len(t, conn.recorded(), 1)
++	require.Empty(t, conn.recorded())
+ 
+ 	// One ledger receive entry per descriptor, told inside the commit.
+ 	require.Len(t, sink.msgs, len(descs))
+@@ -1281,3 +1279,35 @@ func TestQueueVTXOsReceivedStampsSessionID(t *testing.T) {
+ 	require.Equal(t, [32]byte(sid), msg.SessionID)
+ 	require.Equal(t, int64(3_000), msg.AmountSat)
+ }
++
++// TestSessionActorIncomingAckStaysLocal prevents persistence-only ack payloads
++// from entering the protobuf transport, which has no IncomingAck RPC.
++func TestSessionActorIncomingAckStaysLocal(t *testing.T) {
++	t.Parallel()
++
++	ctx := t.Context()
++	sid := oorSessionID(0x72)
++	session, err := newReceiveSessionWithState(
++		ctx, sid, &ReceiveAwaitingAck{SessionID: sid}, EnvConfig{},
++	)
++	require.NoError(t, err)
++
++	b := &sessionBehavior{
++		cfg:       SessionActorConfig{ServerConn: &recordingServerConnRef{}},
++		actorID:   ActorIDForSession(sid),
++		log:       btclog.Disabled,
++		sessionID: sid,
++		direction: clientdb.OORSessionDirectionIncoming,
++		fsm:       session.FSM,
++		loaded:    true,
++	}
++	t.Cleanup(b.stopFSM)
++
++	require.NoError(t, b.driveOutbox(ctx, []OutboxEvent{
++		&SendIncomingAckRequest{SessionID: sid},
++	}))
++	require.Empty(t, b.pendingTransport)
++	state, err := b.fsm.CurrentState()
++	require.NoError(t, err)
++	require.IsType(t, &ReceiveCompleted{}, state)
++}

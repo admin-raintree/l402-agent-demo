@@ -4,6 +4,9 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/.bin"
+BTC_RPC_PORT="${L402_BTC_RPC_PORT:-18556}"
+BTC_P2P_PORT="${L402_BTC_P2P_PORT:-18555}"
+export L402_SELLER_PORT="${L402_SELLER_PORT:-8701}"
 D="${L402_DEMO_DIR:-$ROOT/.demo}"
 export L402_DEMO_DIR="$D"
 export PATH="$BIN:$PATH"
@@ -25,13 +28,13 @@ wait_for() {
 }
 btcd_start() {
   mkdir -p "$D/btcd" && touch "$D/btcd/btcd.conf"
-  btcd --regtest --txindex "${RPC[@]}" --rpclisten=127.0.0.1:18556 --listen=127.0.0.1:18555 \
+  btcd --regtest --txindex "${RPC[@]}" --rpclisten="127.0.0.1:$BTC_RPC_PORT" --listen="127.0.0.1:$BTC_P2P_PORT" \
     -C "$D/btcd/btcd.conf" -b "$D/btcd/data" --logdir="$D/btcd/logs" \
     --rpccert="$D/btcd/rpc.cert" --rpckey="$D/btcd/rpc.key" "$@" >"$D/logs/btcd.log" 2>&1 &
   echo $! >"$D/btcd.pid"
   wait_for btcd ctl getblockcount
 }
-ctl() { btcctl -C "$D/btcd/btcd.conf" --regtest "${RPC[@]}" --rpcserver=127.0.0.1:18556 --rpccert="$D/btcd/rpc.cert" "$@"; }
+ctl() { btcctl -C "$D/btcd/btcd.conf" --regtest "${RPC[@]}" --rpcserver="127.0.0.1:$BTC_RPC_PORT" --rpccert="$D/btcd/rpc.cert" "$@"; }
 mine() { ctl generate "$1"; }
 
 # name rpc-port p2p-port
@@ -40,7 +43,7 @@ lnd_start() {
   local extra=()
   [ "$1" = buyer ] && [ "${L402_RPC_MIDDLEWARE:-}" = 1 ] && extra+=(--rpcmiddleware.enable)
   lnd --lnddir="$D/$1" --bitcoin.regtest --bitcoin.node=btcd \
-    --btcd.rpchost=127.0.0.1:18556 --btcd.rpcuser=demo --btcd.rpcpass=demo --btcd.rpccert="$D/btcd/rpc.cert" \
+    --btcd.rpchost="127.0.0.1:$BTC_RPC_PORT" --btcd.rpcuser=demo --btcd.rpcpass=demo --btcd.rpccert="$D/btcd/rpc.cert" \
     --noseedbackup --norest --rpclisten="127.0.0.1:$2" --listen="127.0.0.1:$3" \
     --alias="$1" --trickledelay=50 --nobootstrap ${extra[@]+"${extra[@]}"} >"$D/logs/$1.log" 2>&1 &
   echo $! >"$D/$1.pid"
@@ -48,7 +51,7 @@ lnd_start() {
 cli() { local n=$1 port=$2; shift 2; lncli --lnddir="$D/$n" --network=regtest --rpcserver="127.0.0.1:$port" "$@"; }
 buyer() { cli buyer 10019 "$@"; }
 seller() { cli seller 10020 "$@"; }
-synced() { "$1" getinfo | grep -q '"synced_to_chain": true'; }
+synced() { "$1" getinfo | bun -e 'process.exit((await Bun.stdin.json()).synced_to_chain ? 0 : 1)'; }
 wait_synced() { wait_for "$1 to sync" synced "$1"; }
 
 echo "Starting btcd…"
@@ -61,7 +64,7 @@ mine 1 >/dev/null
 echo "Creating the agent wallet…"
 lnd_start buyer 10019 9745
 wait_synced buyer
-ADDR=$(buyer newaddress p2wkh | sed -n 's/.*"address": "\(.*\)".*/\1/p')
+ADDR=$(buyer newaddress p2wkh | bun -e 'console.log((await Bun.stdin.json()).address)')
 kill "$(cat "$D/buyer.pid")"; wait "$(cat "$D/buyer.pid")" 2>/dev/null || true
 kill "$(cat "$D/btcd.pid")"; wait "$(cat "$D/btcd.pid")" 2>/dev/null || true
 btcd_start --miningaddr="$ADDR"
@@ -72,16 +75,16 @@ lnd_start buyer 10019 9745
 lnd_start seller 10020 9746
 wait_synced buyer
 wait_synced seller
-funded() { buyer walletbalance | grep -q '"confirmed_balance": "[1-9]'; }
+funded() { buyer walletbalance | bun -e 'process.exit(BigInt((await Bun.stdin.json()).confirmed_balance) > 0n ? 0 : 1)'; }
 wait_for "buyer funds" funded
 
 echo "Opening a 2,000,000-sat channel from the agent wallet to the provider…"
-SELLER_PUBKEY=$(seller getinfo | sed -n 's/.*"identity_pubkey": "\(.*\)".*/\1/p')
+SELLER_PUBKEY=$(seller getinfo | bun -e 'console.log((await Bun.stdin.json()).identity_pubkey)')
 buyer connect "$SELLER_PUBKEY@127.0.0.1:9746" >/dev/null
 buyer openchannel --node_key="$SELLER_PUBKEY" --local_amt=2000000 >/dev/null
 sleep 1
 mine 6 >/dev/null
-channel_active() { buyer listchannels --active_only | grep -q '"active": true'; }
+channel_active() { buyer listchannels --active_only | bun -e 'process.exit((await Bun.stdin.json()).channels.some(c => c.active) ? 0 : 1)'; }
 wait_for "channel to open" channel_active
 wait_for "payment route" buyer queryroutes --dest="$SELLER_PUBKEY" --amt=1000 --fee_limit=10
 
@@ -110,26 +113,26 @@ services:
   - name: "catalog"
     hostregexp: '.*'
     pathregexp: '^/\.well-known/.*$'
-    address: "127.0.0.1:8701"
+    address: "127.0.0.1:$L402_SELLER_PORT"
     protocol: http
     price: 0
     authwhitelistpaths: ['^/\.well-known/.*$']
   - name: "hashprice"
     hostregexp: '.*'
     pathregexp: '^/v1/hashprice.*$'
-    address: "127.0.0.1:8701"
+    address: "127.0.0.1:$L402_SELLER_PORT"
     protocol: http
     price: 10
   - name: "breakeven"
     hostregexp: '.*'
     pathregexp: '^/v1/breakeven.*$'
-    address: "127.0.0.1:8701"
+    address: "127.0.0.1:$L402_SELLER_PORT"
     protocol: http
     price: 50
   - name: "report"
     hostregexp: '.*'
     pathregexp: '^/v1/report.*$'
-    address: "127.0.0.1:8701"
+    address: "127.0.0.1:$L402_SELLER_PORT"
     protocol: http
     price: 1000
 YAML
@@ -142,5 +145,5 @@ echo
 echo "Ready."
 echo "  Aperture (L402 proxy):  http://127.0.0.1:8700"
 echo "  Provider node:          $SELLER_PUBKEY"
-echo "  Agent channel balance:  $(buyer channelbalance | grep -A1 '"local_balance"' | sed -n 's/.*"sat": "\([0-9]*\)".*/\1/p') sats"
+echo "  Agent channel balance:  $(buyer channelbalance | bun -e 'console.log((await Bun.stdin.json()).local_balance.sat)') sats"
 echo "  Logs:                   $D/logs"

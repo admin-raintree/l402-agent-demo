@@ -25,14 +25,14 @@ services:
   - name: "catalog"
     hostregexp: '.*'
     pathregexp: '^/\\.well-known/.*$'
-    address: "127.0.0.1:8701"
+    address: "127.0.0.1:${process.env.L402_SELLER_PORT ?? 8701}"
     protocol: http
     price: 0
     authwhitelistpaths: ['^/\\.well-known/.*$']
   - name: "hashprice"
     hostregexp: '.*'
     pathregexp: '^/v1/hashprice.*$'
-    address: "127.0.0.1:8701"
+    address: "127.0.0.1:${process.env.L402_SELLER_PORT ?? 8701}"
     protocol: http
     price: 10
     timeout: ${timeoutSeconds}

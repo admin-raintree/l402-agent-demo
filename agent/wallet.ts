@@ -106,7 +106,7 @@ export function lndWallet(root: string, demo: string, env: Record<string, string
 }
 
 type WavelengthOptions = {
-	/** waved HTTP/JSON gateway, e.g. https://localhost:10031 */
+	/** waved HTTP/JSON gateway, e.g. http://127.0.0.1:10031 (TLS is on its gRPC port). */
 	url: string;
 	/** Hex macaroon, sent in the `macaroon` header. Bake one scoped to PrepareSend, Send, List, and Balance. */
 	macaroonHex?: string;

@@ -15,10 +15,10 @@ clone() {
   fi
 }
 clone https://github.com/btcsuite/btcd.git btcd v0.26.2
-clone https://github.com/lightningnetwork/lnd.git lnd v0.21.3-beta
+clone https://github.com/lightningnetwork/lnd.git lnd-v0.21.4-beta v0.21.4-beta
 clone https://github.com/lightninglabs/aperture.git aperture v0.5.0
 
 (cd "$SRC/btcd" && go install . ./cmd/btcctl)
-(cd "$SRC/lnd" && go install -tags="signrpc walletrpc chainrpc invoicesrpc routerrpc peersrpc" ./cmd/lnd ./cmd/lncli)
+(cd "$SRC/lnd-v0.21.4-beta" && go install -tags="signrpc walletrpc chainrpc invoicesrpc routerrpc peersrpc" ./cmd/lnd ./cmd/lncli)
 (cd "$SRC/aperture" && go install ./cmd/aperture)
 ls "$GOBIN"

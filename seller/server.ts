@@ -2,7 +2,7 @@
 // this process only serves data and the free L402 discovery manifest.
 import snapshot from "./snapshot.json";
 
-const PORT = 8701;
+const PORT = Number(process.env.L402_SELLER_PORT ?? 8701);
 const MEMPOOL = "https://mempool.space/api/v1";
 const SAT = 100_000_000;
 

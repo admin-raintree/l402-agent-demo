@@ -148,7 +148,8 @@ Tested on 2026-10-21 against RC2 commit `952e6ca` on signet:
 - The first 1,000-sat invoice timed out, then refunded in full with `FAILURE_REASON_INCORRECT_PAYMENT_DETAILS`. It was not paid again.
 - A fresh external 1,500-sat invoice settled with a 1-sat fee. The test verified the preimage’s SHA-256 hash and matching payment history. Reconciliation after a daemon restart also passed.
 - With the acknowledgment patch applied, a further 1,500-sat attempt was receiver-rejected and fully refunded. Both the incoming change and refund transfers completed without the protobuf error. The successful payment still reconciled on the patched daemon.
-- Final spendable balance: 998,244 sats, exactly 999,745 minus the successful 1,500-sat payment and 1-sat fee. No outgoing payments remain pending. The public test receiver rejected two invoices and accepted one, so a new public-network attempt is not guaranteed to pass.
+- A fresh 1,500-sat payment subsequently settled entirely on the rebuilt patched daemon with a 1-sat fee. Payment hash: `77c1eda91eea1525f08e8a1bee6e07b4565b93f44ca68843b12500d345f8b2e2`. Preimage verification, matching completed history, and reconciliation after restarting the same binary all passed. Its incoming change reached `ReceiveCompleted` without an acknowledgment protobuf error.
+- Final spendable balance: 996,743 sats, exactly 999,745 minus two successful 1,500-sat payments and their 1-sat fees. No incoming or outgoing amounts remain pending. The public test receiver also rejected two earlier invoices, so a new public-network attempt is not guaranteed to pass.
 
 RC2 also sends an internal OOR acknowledgment over REST despite having no corresponding RPC. This produces the protobuf `SendIncomingAckRequest` error independently of Lightning settlement. The optional [local patch](patches/README.md) fixes that path and includes a regression test:
 
@@ -160,7 +161,7 @@ WAVELENGTH_RC2_ACK_FIX=1 bun run build:wavelength
 After a timeout, inspect `wavecli activity --kind send` and keep the daemon running for settlement/recovery. A timeout is not proof of failure. To verify a previously submitted payment without sending another one:
 
 ```sh
-WAVELENGTH_TEST_PAYMENT_HASH=93cc98df6cb18bcbb22cc6273f11a8f32e9bdee88b2facd4a70837fd803ede0a \
+WAVELENGTH_TEST_PAYMENT_HASH=77c1eda91eea1525f08e8a1bee6e07b4565b93f44ca68843b12500d345f8b2e2 \
   bun run verify:wavelength --reconcile
 ```
 

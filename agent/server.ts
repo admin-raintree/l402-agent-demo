@@ -1,6 +1,7 @@
 // MCP server that gives an agent a Lightning wallet (lnd or Wavelength) with a spending policy.
 // It discovers L402 services, pays their challenges, reuses paid tokens, asks a
 // human (MCP elicitation) above a threshold, and keeps a receipt for every decision.
+import { assessResponse, qualitySchema } from "./quality";
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -153,7 +154,7 @@ server.registerTool("l402_task_create", {
 
 server.registerTool("l402_task", {
 	title: "Task spending and receipts",
-	description: "Show a task's lifetime settled cost, unresolved reservations, remaining budget, and receipts. Reconciles pending payments.",
+	description: "Show a task's lifetime settled cost, unresolved reservations, remaining budget, receipts, and response quality assessments. Reconciles pending payments.",
 	inputSchema: { task_id: z.string().uuid() },
 	annotations: { readOnlyHint: true },
 }, async ({ task_id }) => {
@@ -230,10 +231,11 @@ server.registerTool(
 			task_id: z.string().uuid().optional(),
 			method: z.enum(["GET", "POST"]).default("GET"),
 			body: z.string().optional(),
+			quality: qualitySchema.optional().describe("Required JSON fields and/or freshness checks; failures never authorize repayment"),
 		},
 		annotations: { readOnlyHint: false, openWorldHint: true },
 	},
-	async ({ url: href, max_sats, method, body, task_id }) => serialized(async () => {
+	async ({ url: href, max_sats, method, body, task_id, quality }) => serialized(async () => {
 		if (task_id) store.task(task_id);
 		const url = new URL(href);
 		if (!["https:", "http:"].includes(url.protocol) || url.username || url.password) throw new Error("invalid provider URL");
@@ -243,16 +245,39 @@ server.registerTool(
 		await reconcile();
 		const call = (authorization?: string) =>
 			fetch(url, { method, body, redirect: "error", headers: authorization ? { authorization } : {}, signal: AbortSignal.timeout(15_000) });
-		const deliver = async (authorization: string, payment: Record<string, unknown>) => {
-			try {
-				const res = await call(authorization);
-				return json({ status: res.status, paid: true, proof_of_payment: true, resource_delivered: res.ok,
-					payment, body: await readBody(res),
-					...(!res.ok ? { reason: "paid credential did not deliver the resource; automatic repayment blocked" } : {}) });
-			} catch {
-				return json({ paid: true, proof_of_payment: true, resource_delivered: false, payment,
-					reason: "resource response unavailable; delivery is unknown; automatic repayment blocked" });
+		// Record each authenticated attempt separately: reused access may yield different data.
+		const assess = (responseBody: unknown, status: number | null, payment: Record<string, unknown> | null, unavailable = false) => {
+			const result = assessResponse(responseBody, status, quality, new Date(), unavailable);
+			if (payment) {
+				const id = randomUUID();
+				store.recordResponse({ id, task_id, url: url.href, method, http_status: status,
+					payment_hash: typeof payment.payment_hash === "string" ? payment.payment_hash : undefined,
+					reused_paid_token: payment.reused_paid_token === true,
+					resource_delivered: !unavailable && status !== null && status >= 200 && status < 300, quality: result });
+				return { quality: result, response_check_id: id };
 			}
+			return { quality: result };
+		};
+		const unavailable = (payment: Record<string, unknown>, status: number | null = null) =>
+			json({ paid: true, proof_of_payment: true, resource_delivered: false, payment,
+				...assess(undefined, status, payment, true),
+				reason: "resource response unavailable; delivery is unknown; automatic repayment blocked" });
+		const respond = async (res: Response, payment: Record<string, unknown> | null) => {
+			let responseBody: unknown;
+			try { responseBody = await readBody(res); }
+			catch {
+				if (payment) return unavailable(payment, res.status);
+				return json({ status: res.status, payment: null, resource_delivered: false, ...assess(undefined, res.status, null, true) });
+			}
+			return json({ status: res.status, ...(payment ? { paid: true, proof_of_payment: true } : {}),
+				resource_delivered: res.ok, payment, body: responseBody, ...assess(responseBody, res.status, payment),
+				...(!res.ok && payment ? { reason: "paid credential did not deliver the resource; automatic repayment blocked" } : {}) });
+		};
+		const deliver = async (authorization: string, payment: Record<string, unknown>) => {
+			let res: Response;
+			try { res = await call(authorization); }
+			catch { return unavailable(payment); }
+			return respond(res, payment);
 		};
 		const sub = store.subscriptionFor(url.origin, service);
 		let first: Response | undefined;
@@ -262,17 +287,18 @@ server.registerTool(
 			const held = store.serviceCredential(sub.origin, sub.service);
 			if (held) {
 				const validUntil = credentialExpiry(held.token);
-				const reuse = { amount_sat: 0, reused_paid_token: true, subscription_id: held.subscriptionId, period: held.period,
+				const heldSub = store.subscription(held.subscriptionId);
+				const reuse = { amount_sat: 0, reused_paid_token: true,
+					payment_hash: store.forKey(periodKey(heldSub, held.period))?.payment_hash, subscription_id: held.subscriptionId, period: held.period,
 					valid_until: validUntil ? new Date(validUntil * 1000).toISOString() : null };
 				let res: Response;
 				try { res = await call(held.token); }
-				catch { return json({ paid: true, proof_of_payment: true, resource_delivered: false, payment: reuse,
-					reason: "resource response unavailable; delivery is unknown; automatic repayment blocked" }); }
-				if (res.status !== 402) return json({ status: res.status, paid: true, proof_of_payment: true, resource_delivered: res.ok,
-					payment: reuse, body: await readBody(res), ...(!res.ok ? { reason: "paid credential did not deliver the resource" } : {}) });
+				catch { return unavailable(reuse); }
+				if (res.status !== 402) return respond(res, reuse);
+				const rejected = assess(undefined, res.status, reuse);
 				// Only a lapse the credential itself proves can trigger a renewal; an early 402 is a rejection.
 				if (validUntil === undefined || now.getTime() < validUntil * 1000)
-					return json({ status: 402, paid: true, resource_delivered: false, payment: reuse,
+					return json({ status: 402, paid: true, resource_delivered: false, payment: reuse, ...rejected,
 						reason: "subscription credential rejected before its expiry; automatic repayment blocked" });
 				first = res;
 			}
@@ -296,7 +322,7 @@ server.registerTool(
 		}
 
 		first ??= await call();
-		if (first.status !== 402) return json({ status: first.status, payment: null, body: await readBody(first) });
+		if (first.status !== 402) return respond(first, null);
 		const challenge = parseChallenge(first.headers.get("www-authenticate"));
 		if (!challenge) return json({ status: 402, paid: false, error: "402 response without an L402 challenge" });
 		const quote = await wallet.quote(challenge.invoice, FEE_LIMIT_SATS);
@@ -426,7 +452,7 @@ server.registerTool(
 	"l402_wallet",
 	{
 		title: "Wallet and spending",
-		description: "Show the wallet backend, spending policy, today's spend, remaining daily budget, balance, and recent receipts.",
+		description: "Show the wallet backend, spending policy, today's spend, remaining daily budget, balance, recent receipts, and response quality assessments.",
 		annotations: { readOnlyHint: true },
 	},
 	async () => {
@@ -439,6 +465,7 @@ server.registerTool(
 			remaining_today_sat: Math.max(0, policy.dailyBudgetSats - spent),
 			wallet: wallet.name,
 			balance_sat: await wallet.balanceSat(),
+			recent_response_checks: store.responseChecks(),
 			recent_receipts: ledger.slice(-8).map(r => ({ ts: r.ts, task_id: r.task_id, url: r.url, service: r.service, amount_sat: r.amount_sat, fee_sat: r.fee_sat, payment_hash: r.payment_hash, approval: r.approval, outcome: r.outcome, reason: r.reason, proof_of_payment: r.proof_of_payment })),
 			reserved_sat: ledger.filter(r => r.outcome === "pending").reduce((sum, r) => sum + r.amount_sat + r.fee_sat, 0),
 		});

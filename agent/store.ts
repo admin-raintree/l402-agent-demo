@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { decide, type Policy, type Receipt, spentToday } from "./policy";
 import { periodAt, periodKey, subscriptionState, type Subscription } from "./subscription";
+import type { ResponseCheck } from "./quality";
 import type { Paid, Quote } from "./wallet";
 
 export type Purchase = Receipt & { key: string; macaroon: string; quote: Quote; fee_limit_sat: number;
@@ -25,6 +26,8 @@ export class Store {
 			CREATE TABLE IF NOT EXISTS purchases (hash TEXT PRIMARY KEY, key TEXT NOT NULL, receipt_id INTEGER NOT NULL, data TEXT NOT NULL);
 			CREATE TABLE IF NOT EXISTS tokens (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 			CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY);
+			CREATE TABLE IF NOT EXISTS response_checks (id TEXT PRIMARY KEY, task_id TEXT, payment_hash TEXT, data TEXT NOT NULL);
+			CREATE INDEX IF NOT EXISTS response_checks_task ON response_checks(task_id);
 			CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, data TEXT NOT NULL);
 			CREATE TABLE IF NOT EXISTS subscriptions (id TEXT PRIMARY KEY, data TEXT NOT NULL);
 			CREATE TABLE IF NOT EXISTS renewals (subscription_id TEXT NOT NULL, period INTEGER NOT NULL, payment_hash TEXT NOT NULL,
@@ -66,6 +69,16 @@ export class Store {
 	token(key: string): string | undefined {
 		return (this.db.query("SELECT value FROM tokens WHERE key=?").get(key) as { value: string } | null)?.value;
 	}
+	recordResponse(check: ResponseCheck) {
+		this.db.query("INSERT INTO response_checks VALUES (?, ?, ?, ?)")
+			.run(check.id, check.task_id ?? null, check.payment_hash ?? null, JSON.stringify(check));
+	}
+	responseChecks(taskId?: string): ResponseCheck[] {
+		const rows = taskId === undefined
+			? this.db.query("SELECT data FROM response_checks ORDER BY rowid DESC LIMIT 8").all()
+			: this.db.query("SELECT data FROM response_checks WHERE task_id=? ORDER BY rowid").all(taskId);
+		return (rows as { data: string }[]).map(row => JSON.parse(row.data));
+	}
 	createTask(task: TaskBudget) {
 		if (!Number.isSafeInteger(task.budget_sats) || task.budget_sats <= 0) throw new Error("invalid task budget");
 		this.db.query("INSERT INTO tasks VALUES (?, ?)").run(task.id, JSON.stringify(task));
@@ -82,7 +95,7 @@ export class Store {
 			.reduce((sum, r) => sum + r.amount_sat + r.fee_sat, 0);
 		const settled = cost("paid"), reserved = cost("pending");
 		return { ...task, settled_sat: settled, reserved_sat: reserved,
-			remaining_sat: Math.max(0, task.budget_sats - settled - reserved), receipts };
+			remaining_sat: Math.max(0, task.budget_sats - settled - reserved), receipts, response_checks: this.responseChecks(id) };
 	}
 	checkTask(id: string | undefined, cost: number): string | undefined {
 		if (!id) return;

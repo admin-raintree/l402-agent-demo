@@ -14,6 +14,8 @@ async function setup() {
 	let prepares = 0;
 	let price = 20;
 	let responseStatus = 200;
+	let responseBody = "resource";
+	let failResource = false;
 	let invalidProof = false;
 	let dropResponse = false;
 	let blockSend = false;
@@ -31,7 +33,10 @@ async function setup() {
 		if (path === "/.well-known/l402.json") return Response.json({ services: [{ name: "data", resources: [{ path: "/data", pricing: { model: "fixed", price_msat: price * 1000 } }] }] });
 		if (path === "/data") {
 			resourceCalls++;
-			if (req.headers.get("authorization") === `L402 macaroon:${proof}`) return new Response("resource", { status: responseStatus });
+			if (req.headers.get("authorization") === `L402 macaroon:${proof}`) {
+				if (failResource) return new Response(null, { status: 302, headers: { location: "http://127.0.0.1:1" } });
+				return new Response(responseBody, { status: responseStatus });
+			}
 			return new Response("pay", { status: 402, headers: { "www-authenticate": 'L402 macaroon="macaroon", invoice="invoice"' } });
 		}
 		if (path.endsWith("/prepare-send")) { prepares++; return Response.json({ send_intent_id: "intent", amount_sat: String(price), payment_hash: hash, rail }); }
@@ -72,6 +77,7 @@ async function setup() {
 	}
 	return { connect, entries, hash, url: new URL("data", gateway.url).href,
 		get resourceCalls() { return resourceCalls; }, get prepares() { return prepares; }, get sends() { return sends; }, get lookupStarted() { return lookupStarted; },
+		set responseBody(v: string) { responseBody = v; }, set failResource(v: boolean) { failResource = v; },
 		set price(v: number) { price = v; }, set responseStatus(v: number) { responseStatus = v; }, set invalidProof(v: boolean) { invalidProof = v; },
 		set dropResponse(v: boolean) { dropResponse = v; }, set blockSend(v: boolean) { blockSend = v; }, set blockLookup(v: boolean) { blockLookup = v; },
 		set pending(v: boolean) { pending = v; }, set rail(v: string) { rail = v; },
@@ -236,5 +242,76 @@ test("preview is not authorization: execution checks a changed invoice against t
 		expect(updated.known_estimated_max_total_sat).toBe(31);
 		expect(updated.estimate_fits_budgets).toBe(false);
 		await expect(a.call("l402_fetch", { ...item, task_id: "00000000-0000-4000-8000-000000000000" })).rejects.toThrow("Unknown task");
+	} finally { await f.close(); }
+});
+
+test("paid response checks persist across restart and reuse without altering receipts or budgets", async () => {
+	const f = await setup();
+	try {
+		const a = await f.connect();
+		const { task_id } = await a.call("l402_task_create", { name: "Fresh report", budget_sats: 30 });
+		const quality = { required_fields: ["market.price"], freshness: { field: "as_of", max_age_seconds: 60 } };
+		const args = { url: f.url, max_sats: 100, task_id, quality };
+		f.responseBody = JSON.stringify({ market: { price: 0 }, as_of: new Date().toISOString() });
+		const first = await a.call("l402_fetch", args);
+		expect(first.quality).toMatchObject({ status: "passed", usable: true, requirements: quality });
+		expect(first.resource_delivered).toBe(true);
+		const receipt = (await a.call("l402_task", { task_id })).receipts[0];
+		await a.client.close();
+		const b = await f.connect();
+		f.responseBody = JSON.stringify({ market: {}, as_of: "2000-01-01T00:00:00Z" });
+		const second = await b.call("l402_fetch", args);
+		expect(second.payment.reused_paid_token).toBe(true);
+		expect(second.resource_delivered).toBe(true);
+		expect(second.quality).toMatchObject({ status: "failed", usable: false,
+			reasons: ["missing_required_field:market.price", "stale_timestamp:as_of"] });
+		const task = await b.call("l402_task", { task_id });
+		expect(task.receipts).toEqual([receipt]);
+		expect(task.remaining_sat).toBe(7);
+		expect(task.response_checks.map((r: { quality: { status: string } }) => r.quality.status)).toEqual(["passed", "failed"]);
+		expect(task.response_checks.map((r: { payment_hash: string }) => r.payment_hash)).toEqual([f.hash, f.hash]);
+		expect(task.response_checks[1].id).toBe(second.response_check_id);
+		expect((await b.call("l402_wallet")).recent_response_checks[0].quality.usable).toBe(false);
+		const other = await b.call("l402_task_create", { name: "Reuse in another task", budget_sats: 1 });
+		await b.call("l402_fetch", { ...args, task_id: other.task_id });
+		const otherTask = await b.call("l402_task", { task_id: other.task_id });
+		expect(otherTask.receipts).toHaveLength(0);
+		expect(otherTask.remaining_sat).toBe(1);
+		expect(otherTask.response_checks[0].payment_hash).toBe(f.hash);
+		expect((await b.call("l402_task", { task_id })).response_checks).toHaveLength(2);
+		expect(f.sends).toBe(1);
+	} finally { await f.close(); }
+});
+
+for (const failure of ["malformed", "http", "oversized", "redirect"] as const) test(`paid ${failure} response is recorded as unusable without repayment`, async () => {
+	const f = await setup();
+	try {
+		const a = await f.connect();
+		f.responseBody = failure === "oversized" ? "x".repeat(65 * 1024) : "{broken";
+		f.responseStatus = failure === "http" ? 503 : 200;
+		f.failResource = failure === "redirect";
+		const args = { url: f.url, max_sats: 100, quality: { required_fields: ["value"] } };
+		for (let i = 0; i < 2; i++) {
+			const result = await a.call("l402_fetch", args);
+			expect(result.quality.usable).toBe(false);
+		}
+		const wallet = await a.call("l402_wallet");
+		expect(wallet.spent_today_sat).toBe(23);
+		expect(wallet.recent_receipts).toHaveLength(1);
+		expect(wallet.recent_response_checks).toHaveLength(2);
+		expect(wallet.recent_response_checks.every((r: { payment_hash: string }) => r.payment_hash === f.hash)).toBe(true);
+		expect(f.sends).toBe(1);
+	} finally { await f.close(); }
+});
+
+test("unconfigured quality remains unknown; invalid requirements send no request or payment", async () => {
+	const f = await setup();
+	try {
+		const a = await f.connect();
+		await expect(a.call("l402_fetch", { url: f.url, max_sats: 100, quality: {} })).rejects.toThrow();
+		expect(f.resourceCalls).toBe(0);
+		expect(f.sends).toBe(0);
+		expect((await a.call()).quality).toMatchObject({ status: "not_checked", usable: null });
+		expect((await a.call("l402_wallet")).recent_response_checks[0].quality.usable).toBeNull();
 	} finally { await f.close(); }
 });

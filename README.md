@@ -99,6 +99,35 @@ Preview results are advisory. Prices and available budgets can change; every fet
 
 Execute each purchase using `l402_fetch` with the same `task_id`, URL, and `max_sats`. Then call `l402_task` with `{ "task_id": "<returned task_id>" }` to see settled spending, unresolved reservations, remaining allowance, and all task receipts. Reused credentials create no new purchase receipt or charge. Wallet receipts also include the task ID. Task caps supplement the wallet-wide daily limit; they are opt-in attribution, not isolation between agents that share wallet access.
 
+## Response quality
+
+Pass `quality` to `l402_fetch` to check required JSON fields and/or data freshness:
+
+```json
+{
+  "url": "http://127.0.0.1:8700/v1/hashprice",
+  "max_sats": 20,
+  "quality": {
+    "required_fields": ["hashprice_usd_per_ph_day", "source"],
+    "freshness": { "field": "as_of", "max_age_seconds": 300 }
+  }
+}
+```
+
+Required fields use dot-separated paths, including array indices such as `items.0.price`. Each must exist as an own property and be non-null; zero, false, and empty strings are valid. These are presence checks, not type or value checks. Freshness requires an ISO timestamp with an explicit timezone (`Z` or an offset); the field defaults to `as_of`. Missing, invalid, future, or older-than-allowed timestamps fail. Age is measured when the body is read; the exact maximum age is accepted. The provider supplies the timestamp, so passing does not establish factual accuracy or independent provenance.
+
+Fetch results include `quality.status`, `quality.usable`, the requirements, check time, failure reasons, and data age when available:
+
+- `passed` / `true`: HTTP succeeded and all requested checks passed.
+- `failed` / `false`: a check failed, HTTP failed, or the response could not be read.
+- `not_checked` / `null`: HTTP succeeded but no quality checks were requested.
+
+`resource_delivered` still describes successful HTTP/body delivery. A response can have `paid: true` and `resource_delivered: true` but `quality.usable: false`. The bundled fixed-market snapshot will fail a short freshness window; its timestamp is preserved rather than replaced with the current time.
+
+Each authenticated response attempt, including credential reuse and failed delivery, gets a `response_check_id` and an append-only assessment linked to its payment hash (when known) and the current fetch's task ID. `l402_task.response_checks` shows that task's history; `l402_wallet.recent_response_checks` shows the latest eight assessments. The records store metadata and check results, not response bodies or credentials. Legacy credentials may lack a payment hash, and historical purchases or crashes before recording an assessment have no inferred quality result. Free responses are checked and returned but are not stored in paid-response history.
+
+Quality failures do not refund spending, release settled charges, invalidate credentials, or authorize another payment. Later calls may reuse the credential and assess a different response; earlier assessments and payment receipts remain unchanged.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -210,7 +239,7 @@ bun run build:litd && bun run verify:litd # litd account limits
 
 The test-network checks use fixed ports, so run one at a time.
 
-`verify:local` includes `scripts/task-smoke.ts`: it checks previews against independent invoice/payment counts, fee-inclusive task refusals, actual-cost receipts, persistence after restarting MCP, free credential reuse, and the shared daily limit. Buyer payment proofs and seller invoices are reconciled independently. Verified on local regtest on 2026-10-21: an 80-sat preview settled as 60 sats with zero routing fees, leaving 20 sats in both the task and daily budgets. Preview and credential reuse created no new invoices or payments.
+`verify:local` includes `scripts/task-smoke.ts`: it checks previews against independent invoice/payment counts, fee-inclusive task refusals, actual-cost receipts, persistence after restarting MCP, free credential reuse, the shared daily limit, and response quality failures without repayment. Buyer payment proofs and seller invoices are reconciled independently. Verified on local regtest on 2026-10-21: an 80-sat preview settled as 60 sats with zero routing fees, leaving 20 sats in both the task and daily budgets. Preview and credential reuse created no new invoices or payments.
 
 Not tested: mainnet payments, disk or power loss (process crashes are tested), subscription periods longer than seconds, and a litd account expiring mid-payment.
 

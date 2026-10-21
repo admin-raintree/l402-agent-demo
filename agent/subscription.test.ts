@@ -247,3 +247,24 @@ test("standing renewals also enforce lifetime task budgets without consuming a r
 	expect(store.periodSpent("sub", 1)).toBe(0);
 	expect(store.ledger()).toHaveLength(1);
 }));
+
+test("subscription purchases, reuse and early credential rejection retain response quality history", async () => {
+	const f = await provider(30);
+	try {
+		await f.call("l402_subscribe", { url: f.url, cap_sats_per_period: 31, periods: 2, period_seconds: 60 });
+		const args = { url: f.url, max_sats: 100, quality: { required_fields: ["price"] } };
+		const first = await f.call("l402_fetch", args);
+		const reuse = await f.call("l402_fetch", args);
+		expect(first.quality.usable).toBe(false);
+		expect(reuse.quality.usable).toBe(false);
+		expect(reuse.payment.payment_hash).toBe(first.payment.payment_hash);
+		f.state.reject = true;
+		const rejected = await f.call("l402_fetch", args);
+		expect(rejected.quality.reasons).toEqual(["http_status:402"]);
+		const wallet = await f.call("l402_wallet", {});
+		expect(wallet.recent_response_checks).toHaveLength(3);
+		expect(wallet.recent_response_checks.every((r: { payment_hash: string }) => r.payment_hash === first.payment.payment_hash)).toBe(true);
+		expect(wallet.spent_today_sat).toBe(21);
+		expect(f.state.sends).toBe(1);
+	} finally { await f.close(); }
+});

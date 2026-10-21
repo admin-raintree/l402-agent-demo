@@ -73,9 +73,10 @@ try {
 	step("Task 3. Buy both resources; receipts charge actual fees instead of the reserve");
 	const bought = [];
 	for (const purchase of purchases) {
-		const result = await call("l402_fetch", { ...purchase, task_id });
+		const result = await call("l402_fetch", { ...purchase, task_id, quality: { required_fields: ["as_of", "source"] } });
 		assert.equal(result.status, 200);
 		assert.equal(result.resource_delivered, true);
+		assert.equal(result.quality.usable, true);
 		assert.equal(result.payment.task_id, task_id);
 		bought.push(result.payment);
 	}
@@ -96,12 +97,32 @@ try {
 	assert.equal(reuse.known_estimated_max_total_sat, 0);
 	assert(reuse.items.every((item: { credential_reuse_possible: boolean }) => item.credential_reuse_possible));
 	for (const purchase of purchases) {
-		const result = await call("l402_fetch", { ...purchase, task_id });
+		const result = await call("l402_fetch", { ...purchase, task_id, quality: { required_fields: ["as_of", "source"] } });
 		assert.equal(result.status, 200);
 		assert.equal(result.payment.reused_paid_token, true);
 	}
 	assert.deepEqual(await activity(), afterBuy);
-	assert.deepEqual(await call("l402_task", { task_id }), task);
+	const reusedTask = await call("l402_task", { task_id });
+	assert.deepEqual(reusedTask.receipts, task.receipts);
+	assert.equal(reusedTask.settled_sat, task.settled_sat);
+	assert.equal(reusedTask.remaining_sat, task.remaining_sat);
+	assert.equal(reusedTask.response_checks.length, 4);
+
+	step("Task 4b. Stale and missing-field responses are unusable without additional payment");
+	const stale = await call("l402_fetch", { ...purchases[0], task_id,
+		quality: { freshness: { field: "as_of", max_age_seconds: 0 } } });
+	assert.equal(stale.resource_delivered, true);
+	assert.equal(stale.quality.usable, false);
+	assert.deepEqual(stale.quality.reasons, ["stale_timestamp:as_of"]);
+	const missing = await call("l402_fetch", { ...purchases[0], task_id,
+		quality: { required_fields: ["missing_field"] } });
+	assert.equal(missing.quality.usable, false);
+	assert.deepEqual(missing.quality.reasons, ["missing_required_field:missing_field"]);
+	const checked = await call("l402_task", { task_id });
+	assert.equal(checked.response_checks.length, 6);
+	assert.deepEqual(checked.receipts, task.receipts);
+	assert.equal(checked.remaining_sat, 20);
+	assert.deepEqual(await activity(), afterBuy);
 
 	step("Task 5. A larger task cannot bypass the shared daily budget");
 	const large = await call("l402_task_create", { name: "Large report", budget_sats: 2000 });

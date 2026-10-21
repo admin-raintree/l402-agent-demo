@@ -17,6 +17,8 @@ flowchart LR
     Aperture -->|proxies| API[API]
 ```
 
+The diagram shows the default lnd demo. The optional Wavelength backend pays Lightning invoices from an Ark wallet through its operator and swap service.
+
 ## Built on Lightning Labs software
 
 | Component | Version | Role here |
@@ -31,17 +33,19 @@ The rest isn't from Lightning Labs. [btcd](https://github.com/btcsuite/btcd) run
 ## How a payment works
 
 1. The agent calls `l402_fetch` with a URL and the most it's willing to spend (`max_sats`).
-2. Aperture replies `402` with an invoice and a macaroon. The server decodes the invoice with lnd and adds the 10-sat maximum routing fee.
+2. Aperture replies `402` with an invoice and a macaroon. The selected wallet backend decodes or previews the invoice. The MCP server budgets for its amount plus a fixed 10-sat maximum routing fee.
 3. It checks the limits. Up to the auto-approval amount, it pays without asking. Above that, it asks you to approve. Above `max_sats` or the daily budget, it refuses.
 4. Before paying, it reserves the full amount in a local SQLite database. Two agents sharing the database can't both spend the same budget.
-5. It pays through lnd with the fee limit, checks that the preimage matches the invoice's payment hash, and records the actual cost. A 30-sat reservation might settle as 23 sats.
+5. It pays through the selected backend with the fee limit, checks that the preimage matches the invoice's payment hash, and records the actual cost. A 30-sat reservation might settle as 23 sats.
 6. It retries the request with `L402 <macaroon>:<preimage>`. Aperture verifies it and proxies to the API. Later requests to the same service reuse the credential without paying again.
 
-If lnd's answer is lost (a crash or a timeout), the payment stays reserved and is never resent. The next call looks it up in lnd's payment history instead.
+The lnd backend uses `lncli`; Wavelength uses `PrepareSend` to obtain a single-use send intent, submits it with `Send`, then polls activity for settlement and a preimage. Wavelength accepts only the Lightning settlement rail for L402, since an in-Ark transfer may not reveal the required preimage.
+
+If the wallet's answer is lost (a crash or a timeout), the payment stays reserved and is not automatically resent. The next `l402_fetch` or `l402_wallet` call checks the backend's payment history. Unknown outcomes keep their reservation; a confirmed failure releases it. A payment reported as settled without a valid preimage is recorded as paid, but cannot produce an L402 credential or trigger automatic repayment.
 
 ## Try it
 
-Requires [Bun](https://bun.sh) and Go 1.26+. Everything runs on a local Bitcoin test network (regtest) with test coins.
+Requires [Bun](https://bun.sh) and Go 1.26+. The default payment network runs locally on Bitcoin regtest with test coins. The seller fetches public market data unless fixed-data mode is enabled.
 
 ```sh
 bun install --frozen-lockfile
@@ -56,7 +60,9 @@ Open Claude Code (or another MCP client) in this directory. It picks up the serv
 3. Fetch `http://127.0.0.1:8700/v1/report`. At 1,000 sats, it's over the auto-approval limit, so you're asked first. A client that can't show MCP approval prompts gets a refusal instead.
 4. Call `l402_wallet` to see the receipts.
 
-Run `bun run down` to stop the network. The demo seller sells fixed test data: hashprice for 10 sats, break-even data for 50, and a report for 1,000.
+Run `bun run down` to stop the network. The demo seller offers hashprice for 10 sats, break-even data for 50, and a report for 1,000. It fetches market data from mempool.space, caches it for 60 seconds, and falls back to cached data or the bundled snapshot when unavailable. Responses include the data's `as_of` and `source`; fallback data can be stale. Use `L402_FIXED_MARKET=1 bun run up` for repeatable snapshot data, as the verification scripts do.
+
+The break-even endpoint accepts `j_per_th` (miner efficiency, default `17.5`) and `usd_per_kwh` (power price, default `0.05`), for example `/v1/breakeven?j_per_th=21.5&usd_per_kwh=0.07`.
 
 | Tool | What it does |
 |---|---|
@@ -71,28 +77,30 @@ Run `bun run down` to stop the network. The demo seller sells fixed test data: h
 | Variable | Default | Meaning |
 |---|---|---|
 | `L402_AUTO_APPROVE_SATS` | `100` | Pay without asking up to this amount |
-| `L402_DAILY_BUDGET_SATS` | `5000` | Most that can be spent or reserved per UTC day |
+| `L402_DAILY_BUDGET_SATS` | `5000` | Cap on today's settled spending plus all unresolved reservations, including earlier days |
 | `L402_DEMO_DIR` | `.demo` | Test network directory |
 | `L402_STATE_DIR` | `$L402_DEMO_DIR/agent` | Payment database |
 | `L402_BTC_RPC_PORT` | `18556` | Local btcd RPC port; change if another test node uses it |
 | `L402_BTC_P2P_PORT` | `18555` | Local btcd peer port |
 | `L402_SELLER_PORT` | `8701` | Demo seller port behind Aperture |
+| `L402_FIXED_MARKET` | unset | Set to `1` to serve the bundled market snapshot |
+| `L402_WALLET` | `lnd` | Wallet backend: `lnd` or `wavelength`; connection settings are below |
 
-All limits include the maximum routing fee. `bun run up` won't overwrite a non-empty `L402_DEMO_DIR`; point it at a new directory instead.
+All limits include the maximum routing fee. Settled spending is counted on its UTC settlement day; unresolved reservations do not reset at midnight. `bun run up` won't overwrite a non-empty `L402_DEMO_DIR`; point it at a new directory instead.
 
 ## Subscriptions
 
-`l402_subscribe` asks you once to approve up to a set amount per period, for a fixed number of periods, to one service. After that, the agent renews an expired credential without asking.
+`l402_subscribe` asks you once to approve up to `cap_sats_per_period` per period, for a fixed number of `periods`, to one service. `period_seconds` defaults to 30 days. Approval itself does not pay: a later `l402_fetch` buys access or renews an expired credential within the approval. There is no background renewal scheduler.
 
 - At most one renewal is paid per period, and the daily budget still applies.
-- A renewal only happens once the credential has actually expired, so a provider can't trigger extra payments.
+- Replacing a paid credential requires its encoded expiry to have passed. An early rejection, or a credential with no readable expiry, cannot trigger automatic repayment.
 - After you cancel, the current credential keeps working until it expires.
 
 On the seller side, set `timeout` (in seconds) and a fixed `price` on the [Aperture](https://github.com/lightninglabs/aperture) service. Aperture v0.5.0 ignores `timeout` for services that use `dynamicprice` or have no `price`, so their credentials never expire. This is [fixed upstream](https://github.com/lightninglabs/aperture/commit/771f371ba5dcd4f11b864b0caa4ae5c233d9cc4a) but not yet released.
 
 ## A hard ceiling with litd
 
-These limits live in this app. Anything with direct access to the wallet credentials can bypass them. For a ceiling that can't be bypassed, pay through a [litd](https://github.com/lightninglabs/lightning-terminal) account, which refuses any payment over its balance:
+The MCP spending policy lives in this app. A [litd](https://github.com/lightninglabs/lightning-terminal) account also enforces a wallet-side allowance for payments made with its account macaroon, including calls that bypass the MCP server. Broader lnd credentials remain outside that account's boundary, so the agent must only receive the account credential:
 
 ```sh
 litcli accounts create <sats> --expiration_date <unix> --save_to <file>
@@ -106,9 +114,15 @@ litd runs in remote mode next to the buyer's lnd, which must start with `--rpcmi
 
 ## Wallets
 
-- **lnd** (default): works only on the local test network.
+- **lnd** (default): the adapter passes `--network=regtest`. `L402_LND_RPCSERVER`, `L402_LND_TLSCERT`, and `L402_LND_MACAROON` override the demo buyer connection and credential paths.
 - **litd account**: as above.
-- **Wavelength**: set `L402_WALLET=wavelength`, `WAVELENGTH_URL`, and `WAVELENGTH_MACAROON_PATH`. RC2's built-in HTTP gateway uses `http://127.0.0.1:10031`; the daemon's TLS certificate is for its separate gRPC listener. Set `WAVELENGTH_TLS_CERT` only for an HTTPS gateway you have configured.
+- **Wavelength**: set `L402_WALLET=wavelength`, `WAVELENGTH_URL`, and `WAVELENGTH_MACAROON_PATH`. RC2's built-in HTTP gateway uses `http://127.0.0.1:10031`; the daemon's TLS certificate is for its separate gRPC listener. The adapter polls for up to 90 seconds after submission; a timeout leaves the payment unresolved for later reconciliation.
+
+### TLS trust configuration
+
+[`bunfig.toml`](bunfig.toml) configures a bundled public CA file for package installation and loads [`tools/security/tls-preload.mjs`](tools/security/tls-preload.mjs) for runtime TLS. The preload sets the default CA list and supplies the bundled CA file to `fetch` and WebSocket connections.
+
+**Current limitation:** although the Wavelength adapter accepts `WAVELENGTH_TLS_CERT` for an HTTPS gateway, the preload overrides that request's custom CA. A private or self-signed HTTPS gateway therefore cannot rely on this option under the repository's default Bun configuration. The verified signet setup uses the loopback HTTP gateway. Custom-CA HTTPS support needs a code fix and verification.
 
 ### Checking Wavelength RC2
 
@@ -141,15 +155,9 @@ For signet funding, `wavecli recv --onchain` returns a boarding address accepted
 
 To test settlement, fund the wallet with test coins and set `WAVELENGTH_TEST_INVOICE_FILE` to a fresh invoice from an external Lightning receiver on the same test network. Then run `bun run verify:wavelength --pay`. The command caps invoice plus fee reserve at 10,000 sats (`WAVELENGTH_TEST_MAX_SATS` overrides this), allows at most 10 sats in fees, verifies the preimage against the payment hash, and reconciles the payment through activity history. It refuses mainnet. Server-credit spending and top-ups remain disabled.
 
-Tested on 2026-10-21 against RC2 commit `952e6ca` on signet:
+Verified on 2026-10-21: a fresh 1,500-sat payment settled with a 1-sat fee entirely on RC2 `952e6ca` with the local acknowledgment patch applied. Preimage verification, completed payment history, and reconciliation after restarting the same binary passed. Incoming change reached `ReceiveCompleted` without the protobuf error. Authentication and input-rejection checks also passed. See the [verification record](patches/README.md) for hashes, earlier refunds, and balance reconciliation.
 
-- Authentication, balance, unknown-payment lookup, malformed-invoice rejection, and same-Ark refusal passed.
-- A 1,000,000-sat faucet deposit confirmed and boarded through the public operator’s scheduled round, yielding 999,745 spendable sats.
-- The first 1,000-sat invoice timed out, then refunded in full with `FAILURE_REASON_INCORRECT_PAYMENT_DETAILS`. It was not paid again.
-- A fresh external 1,500-sat invoice settled with a 1-sat fee. The test verified the preimage’s SHA-256 hash and matching payment history. Reconciliation after a daemon restart also passed.
-- With the acknowledgment patch applied, a further 1,500-sat attempt was receiver-rejected and fully refunded. Both the incoming change and refund transfers completed without the protobuf error. The successful payment still reconciled on the patched daemon.
-- A fresh 1,500-sat payment subsequently settled entirely on the rebuilt patched daemon with a 1-sat fee. Payment hash: `77c1eda91eea1525f08e8a1bee6e07b4565b93f44ca68843b12500d345f8b2e2`. Preimage verification, matching completed history, and reconciliation after restarting the same binary all passed. Its incoming change reached `ReceiveCompleted` without an acknowledgment protobuf error.
-- Final spendable balance: 996,743 sats, exactly 999,745 minus two successful 1,500-sat payments and their 1-sat fees. No incoming or outgoing amounts remain pending. The public test receiver also rejected two earlier invoices, so a new public-network attempt is not guaranteed to pass.
+This validates the Wavelength wallet adapter against a live signet daemon. It does not establish a complete signet MCP → Aperture → paid HTTP resource flow; the full HTTP purchase flow is exercised separately on local regtest with lnd.
 
 RC2 also sends an internal OOR acknowledgment over REST despite having no corresponding RPC. This produces the protobuf `SendIncomingAckRequest` error independently of Lightning settlement. The optional [local patch](patches/README.md) fixes that path and includes a regression test:
 
@@ -183,3 +191,6 @@ Not tested: mainnet payments, disk or power loss (process crashes are tested), s
 - Paying doesn't guarantee a useful response.
 - Separate state directories don't share a budget.
 - Retrying a POST can run the provider's operation twice.
+- Provider and discovery responses are limited to 64 KiB. Redirects are rejected; provider requests time out after 15 seconds and discovery after 5 seconds.
+- Invoice destinations are compared with a manifest's advertised node when the wallet exposes a destination. Wavelength's preview does not expose it, so that check is unavailable for this backend. A provider's own manifest is not independent identity verification.
+- The Wavelength verification script rejects mainnet, but the general adapter has no equivalent network check. Mainnet behavior is untested.

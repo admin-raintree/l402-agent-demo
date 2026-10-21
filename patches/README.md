@@ -33,6 +33,13 @@ The build uses a temporary source archive, applies the patch, runs `go test
 `952e6ca+local-ack`. The original checkout and `.bin/waved` stay unchanged.
 Use the patched executable with the same test-wallet arguments as `waved`.
 
+The signet wallet was funded with a 1,000,000-sat faucet deposit, which
+confirmed and boarded through the public operator's scheduled round,
+yielding 999,745 spendable sats. An initial 1,000-sat payment timed out,
+then fully refunded with `FAILURE_REASON_INCORRECT_PAYMENT_DETAILS`.
+A fresh 1,500-sat payment succeeded with a 1-sat fee before the patch was
+effectively applied; its preimage and payment history were verified.
+
 Live signet verification on 2026-10-21: the patched daemon materialized both
 payment change and a cooperative refund, reaching `ReceiveCompleted` without
 any `SendIncomingAckRequest` errors. The earlier successful Lightning payment
@@ -54,6 +61,12 @@ A fresh payment then succeeded entirely on the actual patched build at
 - Incoming change session `d6992d08…` reached `ReceiveCompleted`. Neither the payment-run log nor the restart log contained `SendIncomingAckRequest` or `unable to resolve`.
 - Restarting the same patched binary and running `verify:wavelength --reconcile` for this hash passed without another payment submission.
 - Balance decreased from 998,244 to 996,743 sats, exactly 1,501 sats, with zero pending incoming/outgoing balance and no pending send entries.
+
+The final balance is 999,745 sats minus two successful 1,500-sat payments
+and their 1-sat fees. The two earlier receiver-rejected payments fully
+refunded. Public receiver availability can vary between attempts.
+These checks exercise the wallet adapter and daemon, not a complete
+signet MCP-to-Aperture paid HTTP request.
 
 Raw build, payment, restart, and activity evidence is retained locally under
 the ignored `.demo/wavelength-rc2-check/` directory. Wallet credentials and

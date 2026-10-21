@@ -8,4 +8,5 @@ trap '"$ROOT/scripts/down.sh"' EXIT
 printf 'Verification state: %s\n' "$L402_DEMO_DIR"
 "$ROOT/scripts/up.sh"
 bun "$ROOT/scripts/smoke.ts"
+bun "$ROOT/scripts/task-smoke.ts"
 bun "$ROOT/scripts/subscription-smoke.ts"

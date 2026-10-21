@@ -140,6 +140,81 @@ server.registerTool(
 	},
 );
 
+server.registerTool("l402_task_create", {
+	title: "Create a task budget",
+	description: "Create a fixed lifetime spending cap, including fees. Pass its task_id to every fetch in the task. Does not reserve funds or authorize payments; daily and human-approval limits still apply.",
+	inputSchema: { name: z.string().trim().min(1).max(200), budget_sats: z.number().int().positive().safe() },
+	annotations: { readOnlyHint: false, openWorldHint: false },
+}, async ({ name, budget_sats }) => {
+	const task = { id: randomUUID(), name, budget_sats, created_at: new Date().toISOString() };
+	store.createTask(task);
+	return json({ task_id: task.id, task: store.taskSummary(task.id) });
+});
+
+server.registerTool("l402_task", {
+	title: "Task spending and receipts",
+	description: "Show a task's lifetime settled cost, unresolved reservations, remaining budget, and receipts. Reconciles pending payments.",
+	inputSchema: { task_id: z.string().uuid() },
+	annotations: { readOnlyHint: true },
+}, async ({ task_id }) => {
+	store.task(task_id);
+	await reconcile();
+	return json(store.taskSummary(task_id));
+});
+
+server.registerTool("l402_preview", {
+	title: "Preview purchases without paying",
+	description: "Estimate a plan from fresh discovery manifests and saved credentials. Only fetches discovery documents; never calls resource endpoints, prepares invoices, pays, prompts, or reserves funds. Estimates are advisory, not approval or a guaranteed quote. Unknown prices need an execution-time invoice check.",
+	inputSchema: {
+		task_id: z.string().uuid().optional(),
+		purchases: z.array(z.object({ url: z.string().url(), method: z.enum(["GET", "POST"]).default("GET"),
+			max_sats: z.number().int().positive().safe() })).min(1).max(100),
+	},
+	annotations: { readOnlyHint: true, openWorldHint: true },
+}, async ({ task_id, purchases }) => {
+	const task = task_id ? store.taskSummary(task_id) : undefined;
+	const dailyRemaining = Math.max(0, policy.dailyBudgetSats - spentToday(store.ledger()));
+	const discovered = new Map<string, Manifest | undefined>();
+	const items = [];
+	for (const item of purchases) {
+		const url = new URL(item.url);
+		if (!["https:", "http:"].includes(url.protocol) || url.username || url.password) throw new Error("invalid provider URL");
+		if (!discovered.has(url.origin)) discovered.set(url.origin, await discover(url.origin).catch(() => undefined));
+		const manifest = discovered.get(url.origin);
+		const service = manifest?.services.find(s => s.resources.some(r => url.pathname === r.path || url.pathname.startsWith(r.path + "/")));
+		const resource = service?.resources.find(r => (url.pathname === r.path || url.pathname.startsWith(r.path + "/")) && (r.method ?? "GET").toUpperCase() === item.method);
+		const serviceName = service?.name ?? url.pathname;
+		const key = `${url.origin} ${serviceName}`;
+		const held = store.serviceCredential(url.origin, serviceName)?.token ?? store.token(key);
+		const expiry = held ? credentialExpiry(held) : undefined;
+		const reusable = !!held && (expiry === undefined || expiry * 1000 > Date.now());
+		const price = resource?.pricing.model === "fixed" && resource.pricing.price_msat !== undefined
+			? Math.ceil(resource.pricing.price_msat / 1000) : undefined;
+		const estimate = reusable ? 0 : price === undefined ? null : price + FEE_LIMIT_SATS;
+		const existing = store.forKey(key);
+		const sub = store.subscriptionFor(url.origin, serviceName);
+		const decision = !reusable && price !== undefined ? decide(price, item.max_sats,
+			policy.dailyBudgetSats - dailyRemaining, policy, FEE_LIMIT_SATS) : undefined;
+		items.push({ ...item, service: serviceName, advertised_price_sat: price ?? null,
+			credential_reuse_possible: reusable, estimated_max_cost_sat: estimate,
+			fee_reserve_sat: reusable ? 0 : FEE_LIMIT_SATS,
+			policy_decision: decision?.kind ?? "requires_execution_check",
+			reason: decision && "reason" in decision ? decision.reason : undefined,
+			task_refusal: estimate === null ? undefined : store.checkTask(task_id, estimate),
+			existing_payment_outcome: existing?.outcome, subscription_id: sub?.id,
+			note: sub ? "Subscription state, period allowance and credential rejection require execution-time checks." :
+				reusable ? "Reuse costs zero if the provider accepts the saved credential." :
+				existing ? "Existing payment must be resolved; automatic repayment is blocked." : undefined });
+	}
+	const knownTotal = items.reduce((sum, item) => sum + (item.estimated_max_cost_sat ?? 0), 0);
+	const complete = items.every(item => item.estimated_max_cost_sat !== null);
+	return json({ task_id, advisory: true, reserves_funds: false, items,
+		known_estimated_max_total_sat: knownTotal, has_unknown_costs: !complete,
+		daily_remaining_sat: dailyRemaining, task_remaining_sat: task?.remaining_sat,
+		estimate_fits_budgets: complete ? knownTotal <= Math.min(dailyRemaining, task?.remaining_sat ?? Infinity) : null,
+		note: "Includes maximum routing fees per purchase. Repeated services are counted separately unless a credential is already saved. Actual invoices, approvals, subscriptions and budgets are checked again when fetching." });
+});
+
 server.registerTool(
 	"l402_fetch",
 	{
@@ -148,16 +223,18 @@ server.registerTool(
 			"Make an HTTP request, paying any L402 Lightning challenge from the agent wallet and reusing a paid token when one exists. " +
 			`Payments up to ${policy.autoApproveSats} sats are automatic; larger ones ask the human; anything over max_sats or the ` +
 			`${policy.dailyBudgetSats}-sat daily budget is refused. All limits include maximum routing fees. Set max_sats to the most this one call may cost. ` +
-			"With an l402_subscribe approval for the service, an expired credential renews once per period without asking.",
+			"Pass task_id to enforce a persistent task budget and attribute its receipts. With an l402_subscribe approval for the service, an expired credential renews once per period without asking.",
 		inputSchema: {
 			url: z.string().url(),
-			max_sats: z.number().int().positive().describe("Most this call may spend, in sats"),
+			max_sats: z.number().int().positive().safe().describe("Most this call may spend, in sats"),
+			task_id: z.string().uuid().optional(),
 			method: z.enum(["GET", "POST"]).default("GET"),
 			body: z.string().optional(),
 		},
 		annotations: { readOnlyHint: false, openWorldHint: true },
 	},
-	async ({ url: href, max_sats, method, body }) => serialized(async () => {
+	async ({ url: href, max_sats, method, body, task_id }) => serialized(async () => {
+		if (task_id) store.task(task_id);
 		const url = new URL(href);
 		if (!["https:", "http:"].includes(url.protocol) || url.username || url.password) throw new Error("invalid provider URL");
 		if (!manifests.has(url.origin)) await discover(url.origin).catch(() => undefined);
@@ -224,7 +301,7 @@ server.registerTool(
 		if (!challenge) return json({ status: 402, paid: false, error: "402 response without an L402 challenge" });
 		const quote = await wallet.quote(challenge.invoice, FEE_LIMIT_SATS);
 		if (!/^[0-9a-f]{64}$/.test(quote.paymentHash)) throw new Error("wallet returned an invalid payment hash");
-		const base = { ts: new Date().toISOString(), url: url.href, service, wallet: wallet.name,
+		const base = { ts: new Date().toISOString(), task_id, url: url.href, service, wallet: wallet.name,
 			amount_sat: quote.amountSat, fee_sat: 0, payment_hash: quote.paymentHash };
 		const stop = (outcome: "declined" | "refused", reason: string, approval: Receipt["approval"] = "none") => {
 			store.record({ ...base, approval, outcome, reason, subscription_id: standing?.sub.id });
@@ -237,6 +314,8 @@ server.registerTool(
 		const spent = spentToday(store.ledger());
 		const decision = decide(base.amount_sat, maxSats, spent, policy, FEE_LIMIT_SATS);
 		if (decision.kind === "refuse") return stop("refused", decision.reason);
+		const taskRefusal = store.checkTask(task_id, base.amount_sat + FEE_LIMIT_SATS);
+		if (taskRefusal) return stop("refused", taskRefusal);
 		if (decision.kind === "ask" && !standing) {
 			let denied: string | undefined;
 			try {
@@ -261,7 +340,7 @@ server.registerTool(
 		const settled = store.purchases().find(p => p.payment_hash === quote.paymentHash)!;
 		const credential = store.token(key);
 		if (!credential) return paymentState(settled);
-		return deliver(credential, { wallet: wallet.name, amount_sat: settled.amount_sat, fee_sat: settled.fee_sat,
+		return deliver(credential, { task_id, wallet: wallet.name, amount_sat: settled.amount_sat, fee_sat: settled.fee_sat,
 			approval: settled.approval, payment_hash: settled.payment_hash,
 			...(standing ? { subscription_id: standing.sub.id, period: standing.period,
 				valid_until: (v => v ? new Date(v * 1000).toISOString() : null)(credentialExpiry(credential)) } : {}),
@@ -360,7 +439,7 @@ server.registerTool(
 			remaining_today_sat: Math.max(0, policy.dailyBudgetSats - spent),
 			wallet: wallet.name,
 			balance_sat: await wallet.balanceSat(),
-			recent_receipts: ledger.slice(-8).map(r => ({ ts: r.ts, url: r.url, service: r.service, amount_sat: r.amount_sat, fee_sat: r.fee_sat, payment_hash: r.payment_hash, approval: r.approval, outcome: r.outcome, reason: r.reason, proof_of_payment: r.proof_of_payment })),
+			recent_receipts: ledger.slice(-8).map(r => ({ ts: r.ts, task_id: r.task_id, url: r.url, service: r.service, amount_sat: r.amount_sat, fee_sat: r.fee_sat, payment_hash: r.payment_hash, approval: r.approval, outcome: r.outcome, reason: r.reason, proof_of_payment: r.proof_of_payment })),
 			reserved_sat: ledger.filter(r => r.outcome === "pending").reduce((sum, r) => sum + r.amount_sat + r.fee_sat, 0),
 		});
 	},

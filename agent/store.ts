@@ -10,6 +10,8 @@ export type Purchase = Receipt & { key: string; macaroon: string; quote: Quote; 
 	/** Set when a standing approval, not a prompt, authorized this purchase. */
 	subscription?: { id: string; period: number } };
 
+export type TaskBudget = { id: string; name: string; budget_sats: number; created_at: string };
+
 export class Store {
 	readonly db: Database;
 	constructor(dir: string) {
@@ -23,6 +25,7 @@ export class Store {
 			CREATE TABLE IF NOT EXISTS purchases (hash TEXT PRIMARY KEY, key TEXT NOT NULL, receipt_id INTEGER NOT NULL, data TEXT NOT NULL);
 			CREATE TABLE IF NOT EXISTS tokens (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 			CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY);
+			CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, data TEXT NOT NULL);
 			CREATE TABLE IF NOT EXISTS subscriptions (id TEXT PRIMARY KEY, data TEXT NOT NULL);
 			CREATE TABLE IF NOT EXISTS renewals (subscription_id TEXT NOT NULL, period INTEGER NOT NULL, payment_hash TEXT NOT NULL,
 				PRIMARY KEY (subscription_id, period));`);
@@ -62,6 +65,29 @@ export class Store {
 	}
 	token(key: string): string | undefined {
 		return (this.db.query("SELECT value FROM tokens WHERE key=?").get(key) as { value: string } | null)?.value;
+	}
+	createTask(task: TaskBudget) {
+		if (!Number.isSafeInteger(task.budget_sats) || task.budget_sats <= 0) throw new Error("invalid task budget");
+		this.db.query("INSERT INTO tasks VALUES (?, ?)").run(task.id, JSON.stringify(task));
+	}
+	task(id: string): TaskBudget {
+		const row = this.db.query("SELECT data FROM tasks WHERE id=?").get(id) as { data: string } | null;
+		if (!row) throw new Error("Unknown task");
+		return JSON.parse(row.data);
+	}
+	taskSummary(id: string) {
+		const task = this.task(id);
+		const receipts = this.ledger().filter(r => r.task_id === id);
+		const cost = (outcome: Receipt["outcome"]) => receipts.filter(r => r.outcome === outcome)
+			.reduce((sum, r) => sum + r.amount_sat + r.fee_sat, 0);
+		const settled = cost("paid"), reserved = cost("pending");
+		return { ...task, settled_sat: settled, reserved_sat: reserved,
+			remaining_sat: Math.max(0, task.budget_sats - settled - reserved), receipts };
+	}
+	checkTask(id: string | undefined, cost: number): string | undefined {
+		if (!id) return;
+		const task = this.taskSummary(id);
+		if (cost > task.remaining_sat) return `would exceed task budget: ${task.remaining_sat} of ${task.budget_sats} sats remain`;
 	}
 	createSubscription(sub: Subscription) {
 		this.db.query("INSERT INTO subscriptions VALUES (?, ?)").run(sub.id, JSON.stringify(sub));
@@ -137,6 +163,8 @@ export class Store {
 			const d = decide(p.amount_sat, maxSats, spentToday(ledger, now), policy, p.fee_limit_sat);
 			if (d.kind === "refuse") throw new Error(d.reason);
 			if (d.kind === "ask" && p.approval !== "human" && !p.subscription) throw new Error("human approval required");
+			const taskRefusal = this.checkTask(p.task_id, p.amount_sat + p.fee_limit_sat);
+			if (taskRefusal) throw new Error(taskRefusal);
 			this.checkSubscription(p, now);
 			p.ts = now.toISOString();
 			p.outcome = "pending";

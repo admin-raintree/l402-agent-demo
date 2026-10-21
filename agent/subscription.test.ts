@@ -237,3 +237,13 @@ test("MCP subscription: a declined approval or an inadequate cap creates nothing
 		expect(f.state.sends).toBe(0);
 	} finally { await f.close(); }
 });
+
+test("standing renewals also enforce lifetime task budgets without consuming a refused period", () => fixture(store => {
+	store.createTask({ id: "task", name: "Report", budget_sats: 60, created_at: start.toISOString() });
+	store.reserve(renewal(1, 0, 50, { task_id: "task" }), 100, policy, at(1));
+	store.finish(hashFor(1), { feeSat: 2, preimage: proofFor(1) }, at(1));
+	expect(store.taskSummary("task").settled_sat).toBe(52);
+	expect(() => store.reserve(renewal(2, 1, 10, { task_id: "task" }), 100, policy, at(31))).toThrow("task budget");
+	expect(store.periodSpent("sub", 1)).toBe(0);
+	expect(store.ledger()).toHaveLength(1);
+}));

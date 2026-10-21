@@ -68,9 +68,36 @@ The break-even endpoint accepts `j_per_th` (miner efficiency, default `17.5`) an
 |---|---|
 | `l402_fetch` | Fetch a URL, paying if needed. Supports GET and POST |
 | `l402_discover` | List a provider's services and prices |
+| `l402_task_create` | Create a persistent task spending cap |
+| `l402_task` | Show task spending, reservations, and receipts |
+| `l402_preview` | Estimate purchases without paying or calling resource endpoints |
 | `l402_wallet` | Show today's spending, balance, and recent receipts; resolve pending payments |
 | `l402_subscribe` | Approve recurring payments to one service (see below) |
 | `l402_subscriptions` | List or cancel subscriptions |
+
+## Task budgets and purchase previews
+
+Create a task with `l402_task_create`, for example `{ "name": "Mining report", "budget_sats": 100 }`. Use the returned `task_id` on every `l402_fetch` for that task. Calls without a task ID continue to use only the existing per-call and daily limits.
+
+A task cap is fixed for the task's lifetime and includes routing fees. Creating it does not reserve money or approve a payment. Before sending, the same SQLite transaction checks the task cap and daily limit and reserves the invoice amount plus the maximum fee. Settlements replace that reservation with actual cost; confirmed failures release it. Pending payments stay reserved across restarts and midnight. Task spending never resets at midnight. Subscription purchases with a task ID also count against its cap.
+
+Use `l402_preview` before executing a plan:
+
+```json
+{
+  "task_id": "<returned task_id>",
+  "purchases": [
+    { "url": "http://127.0.0.1:8700/v1/hashprice", "max_sats": 20 },
+    { "url": "http://127.0.0.1:8700/v1/breakeven", "max_sats": 60 }
+  ]
+}
+```
+
+With the demo's advertised prices and no saved credentials, this estimates 80 sats including maximum fees. The preview fetches fresh discovery manifests but never requests the resources, prepares invoices, prompts, pays, or reserves funds. It reports unknown prices explicitly and shows possible credential reuse. A saved credential costs zero only if the provider accepts it. Repeated services are conservatively counted separately unless a credential is already saved.
+
+Preview results are advisory. Prices and available budgets can change; every fetch checks its actual invoice and current limits again. Subscription eligibility and existing payment outcomes can also prevent a purchase even when its estimate fits. Preview does not reconcile pending payments; use `l402_task` or `l402_wallet` to refresh settlement state.
+
+Execute each purchase using `l402_fetch` with the same `task_id`, URL, and `max_sats`. Then call `l402_task` with `{ "task_id": "<returned task_id>" }` to see settled spending, unresolved reservations, remaining allowance, and all task receipts. Reused credentials create no new purchase receipt or charge. Wallet receipts also include the task ID. Task caps supplement the wallet-wide daily limit; they are opt-in attribution, not isolation between agents that share wallet access.
 
 ## Configuration
 
@@ -177,11 +204,13 @@ WAVELENGTH_TEST_PAYMENT_HASH=77c1eda91eea1525f08e8a1bee6e07b4565b93f44ca68843b12
 
 ```sh
 bun test                                  # unit, crash, and concurrency tests
-bun run verify:local                      # real payments on a fresh test network
+bun run verify:local                      # real payments, task budgets/previews, and subscriptions
 bun run build:litd && bun run verify:litd # litd account limits
 ```
 
 The test-network checks use fixed ports, so run one at a time.
+
+`verify:local` includes `scripts/task-smoke.ts`: it checks previews against independent invoice/payment counts, fee-inclusive task refusals, actual-cost receipts, persistence after restarting MCP, free credential reuse, and the shared daily limit. Buyer payment proofs and seller invoices are reconciled independently. Verified on local regtest on 2026-10-21: an 80-sat preview settled as 60 sats with zero routing fees, leaving 20 sats in both the task and daily budgets. Preview and credential reuse created no new invoices or payments.
 
 Not tested: mainnet payments, disk or power loss (process crashes are tested), subscription periods longer than seconds, and a litd account expiring mid-payment.
 

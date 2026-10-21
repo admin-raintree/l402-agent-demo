@@ -10,6 +10,8 @@ import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 async function setup() {
 	const dir = mkdtempSync(join(tmpdir(), "l402-mcp-"));
 	let sends = 0;
+	let resourceCalls = 0;
+	let prepares = 0;
 	let price = 20;
 	let responseStatus = 200;
 	let invalidProof = false;
@@ -28,10 +30,11 @@ async function setup() {
 		const path = new URL(req.url).pathname;
 		if (path === "/.well-known/l402.json") return Response.json({ services: [{ name: "data", resources: [{ path: "/data", pricing: { model: "fixed", price_msat: price * 1000 } }] }] });
 		if (path === "/data") {
+			resourceCalls++;
 			if (req.headers.get("authorization") === `L402 macaroon:${proof}`) return new Response("resource", { status: responseStatus });
 			return new Response("pay", { status: 402, headers: { "www-authenticate": 'L402 macaroon="macaroon", invoice="invoice"' } });
 		}
-		if (path.endsWith("/prepare-send")) return Response.json({ send_intent_id: "intent", amount_sat: String(price), payment_hash: hash, rail });
+		if (path.endsWith("/prepare-send")) { prepares++; return Response.json({ send_intent_id: "intent", amount_sat: String(price), payment_hash: hash, rail }); }
 		if (path.endsWith("/send")) {
 			sends++;
 			entries.push({ id: hash, status: pending ? "ENTRY_STATUS_PENDING" : "ENTRY_STATUS_COMPLETE", fee_sat: "3", progress: { payment_hash: hash, preimage: invalidProof ? "22".repeat(32) : proof } });
@@ -61,13 +64,14 @@ async function setup() {
 		});
 		await client.connect(transport);
 		clients.push({ client, transport });
-		return { client, transport, async call(name = "l402_fetch", args = { url: new URL("data", gateway.url).href, max_sats: 100 }) {
+		return { client, transport, async call(name = "l402_fetch", args: Record<string, unknown> = { url: new URL("data", gateway.url).href, max_sats: 100 }) {
 			const r = await client.callTool({ name, arguments: name === "l402_wallet" ? {} : args });
 			if (r.isError) throw new Error((r.content as { text: string }[])[0].text);
 			return JSON.parse((r.content as { text: string }[])[0].text);
 		} };
 	}
-	return { connect, entries, hash, get sends() { return sends; }, get lookupStarted() { return lookupStarted; },
+	return { connect, entries, hash, url: new URL("data", gateway.url).href,
+		get resourceCalls() { return resourceCalls; }, get prepares() { return prepares; }, get sends() { return sends; }, get lookupStarted() { return lookupStarted; },
 		set price(v: number) { price = v; }, set responseStatus(v: number) { responseStatus = v; }, set invalidProof(v: boolean) { invalidProof = v; },
 		set dropResponse(v: boolean) { dropResponse = v; }, set blockSend(v: boolean) { blockSend = v; }, set blockLookup(v: boolean) { blockLookup = v; },
 		set pending(v: boolean) { pending = v; }, set rail(v: string) { rail = v; },
@@ -167,5 +171,70 @@ for (const failure of ["invalid-proof", "withheld-resource", "over-budget", "wro
 			else { expect(first.resource_delivered).toBe(false); expect(second.resource_delivered).toBe(false); }
 		}
 		expect(f.sends).toBe(failure === "over-budget" || failure === "wrong-rail" ? 0 : 1);
+	} finally { await f.close(); }
+});
+
+test("task preview is non-paying, aggregates costs, and fetch attributes actual receipts", async () => {
+	const f = await setup();
+	try {
+		const a = await f.connect();
+		const { task_id } = await a.call("l402_task_create", { name: "Report", budget_sats: 35 });
+		const item = { url: f.url, max_sats: 100 };
+		const preview = await a.call("l402_preview", { task_id, purchases: [item, { ...item, method: "POST" }] });
+		expect(preview.items[0].estimated_max_cost_sat).toBe(30);
+		expect(preview.items[1].estimated_max_cost_sat).toBeNull();
+		expect(preview.has_unknown_costs).toBe(true);
+		expect(preview.estimate_fits_budgets).toBeNull();
+		const repeated = await a.call("l402_preview", { task_id, purchases: [item, item] });
+		expect(repeated.known_estimated_max_total_sat).toBe(60);
+		expect(repeated.estimate_fits_budgets).toBe(false);
+		expect(f.sends).toBe(0);
+		expect(f.prepares).toBe(0);
+		expect(f.resourceCalls).toBe(0);
+		expect((await a.call("l402_task", { task_id })).receipts).toHaveLength(0);
+		expect((await a.call("l402_fetch", { ...item, task_id })).resource_delivered).toBe(true);
+		const task = await a.call("l402_task", { task_id });
+		expect(task.settled_sat).toBe(23);
+		expect(task.remaining_sat).toBe(12);
+		expect(task.receipts[0].task_id).toBe(task_id);
+		expect((await a.call("l402_wallet")).recent_receipts[0].task_id).toBe(task_id);
+		const reuse = await a.call("l402_preview", { task_id, purchases: [item] });
+		expect(reuse.items[0].credential_reuse_possible).toBe(true);
+		expect(reuse.known_estimated_max_total_sat).toBe(0);
+		await a.call("l402_fetch", { ...item, task_id });
+		expect(f.sends).toBe(1);
+		expect((await a.call("l402_task", { task_id })).receipts).toHaveLength(1);
+	} finally { await f.close(); }
+});
+
+test("task cap refuses invoice plus fee reserve even when daily policy permits it", async () => {
+	const f = await setup();
+	try {
+		const a = await f.connect();
+		const { task_id } = await a.call("l402_task_create", { name: "Small report", budget_sats: 29 });
+		const result = await a.call("l402_fetch", { url: f.url, max_sats: 100, task_id });
+		expect(result.outcome).toBe("refused");
+		expect(result.reason).toContain("task budget");
+		expect(f.sends).toBe(0);
+		const task = await a.call("l402_task", { task_id });
+		expect(task.remaining_sat).toBe(29);
+		expect(task.receipts[0].outcome).toBe("refused");
+	} finally { await f.close(); }
+});
+
+test("preview is not authorization: execution checks a changed invoice against the task cap", async () => {
+	const f = await setup();
+	try {
+		const a = await f.connect("unsupported");
+		const { task_id } = await a.call("l402_task_create", { name: "Report", budget_sats: 30 });
+		const item = { url: f.url, max_sats: 100 };
+		expect((await a.call("l402_preview", { task_id, purchases: [item] })).estimate_fits_budgets).toBe(true);
+		f.price = 21;
+		expect((await a.call("l402_fetch", { ...item, task_id })).reason).toContain("task budget");
+		expect(f.sends).toBe(0);
+		const updated = await a.call("l402_preview", { task_id, purchases: [item] });
+		expect(updated.known_estimated_max_total_sat).toBe(31);
+		expect(updated.estimate_fits_budgets).toBe(false);
+		await expect(a.call("l402_fetch", { ...item, task_id: "00000000-0000-4000-8000-000000000000" })).rejects.toThrow("Unknown task");
 	} finally { await f.close(); }
 });

@@ -173,3 +173,47 @@ test("independent processes cannot reserve the same daily budget twice", async (
 		expect(results.filter(r=>r==='reserved')).toHaveLength(1); expect(spentToday(store.ledger())).toBe(30);
 	} finally { store.close(); rmSync(dir, {recursive:true,force:true}); }
 });
+
+test("task budgets share atomic reservations, survive restart and midnight, and settle actual fees", () => fixture((store, dir) => {
+	store.createTask({ id: "task", name: "Report", budget_sats: 50, created_at: now.toISOString() });
+	store.reserve({ ...purchase(), task_id: "task" }, 100, policy, now);
+	const other = new Store(dir);
+	try {
+		expect(other.taskSummary("task").remaining_sat).toBe(20);
+		expect(() => other.reserve({ ...purchase("other"), task_id: "task" }, 100, policy, tomorrow)).toThrow("task budget");
+		other.finish(hash, { feeSat: 3, preimage: proof }, now);
+		expect(store.taskSummary("task").remaining_sat).toBe(27);
+		expect(spentToday(store.ledger(), tomorrow)).toBe(0);
+		expect(() => other.reserve({ ...purchase("other"), task_id: "task" }, 100, policy, tomorrow)).toThrow("task budget");
+		other.reserve({ ...purchase("small", 10), task_id: "task" }, 100, policy, tomorrow);
+		expect(store.taskSummary("task").remaining_sat).toBe(7);
+		other.finish("small", "failed", tomorrow);
+		expect(store.taskSummary("task").remaining_sat).toBe(27);
+		expect(store.taskSummary("task").receipts.every(r => r.task_id === "task")).toBe(true);
+	} finally { other.close(); }
+}));
+
+test("task caps cannot bypass daily limits or human approval and unknown tasks fail closed", () => fixture(store => {
+	store.createTask({ id: "task", name: "Report", budget_sats: 1000, created_at: now.toISOString() });
+	expect(() => store.reserve({ ...purchase(hash, 95), task_id: "task", approval: "human" }, 200, policy, now)).toThrow("daily budget");
+	expect(() => store.reserve({ ...purchase(), task_id: "task" }, 100, { ...policy, autoApproveSats: 10 }, now)).toThrow("human approval");
+	expect(() => store.reserve({ ...purchase(), task_id: "missing" }, 100, policy, now)).toThrow("Unknown task");
+	expect(store.ledger()).toHaveLength(0);
+}));
+
+test("independent processes cannot reserve the same task budget twice", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "l402-task-race-"));
+	const store = new Store(dir);
+	try {
+		store.createTask({ id: "task", name: "Concurrent report", budget_sats: 30, created_at: now.toISOString() });
+		const workers = Array.from({length:8}, (_, i) => {
+			const p = { ...purchase(`race-${i}`), task_id: "task" };
+			return Bun.spawn([process.execPath, "-e", `import { Store } from ${JSON.stringify(join(import.meta.dir, "store.ts"))};
+			const store = new Store(${JSON.stringify(dir)});
+			try { store.reserve(${JSON.stringify(p)}, 100, {autoApproveSats:100,dailyBudgetSats:1000}); process.stdout.write('reserved'); }
+			catch { process.stdout.write('refused'); } finally { store.close(); }`], {stdout:"pipe",stderr:"pipe"});
+		});
+		const results = await Promise.all(workers.map(async p => { expect(await p.exited).toBe(0); return new Response(p.stdout).text(); }));
+		expect(results.filter(r=>r==='reserved')).toHaveLength(1); expect(store.taskSummary("task").reserved_sat).toBe(30);
+	} finally { store.close(); rmSync(dir, {recursive:true,force:true}); }
+});

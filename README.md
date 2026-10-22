@@ -4,13 +4,14 @@ An MCP server that lets an AI agent pay for HTTP APIs over Lightning, within lim
 
 [L402](https://docs.lightning.engineering/the-lightning-network/l402) is Lightning Labs' protocol for charging for an API. The server answers `402 Payment Required` with a Lightning invoice and a macaroon. The client pays the invoice and sends `L402 <macaroon>:<preimage>` as a reusable credential.
 
-Giving an agent a wallet to do this is risky. It could overspend, pay twice after a network error, or be tricked by a provider. This server sits between the agent and the wallet and decides what gets paid.
+Giving an agent a wallet to do this is risky. It could overspend, pay twice after a network error, or be tricked by a provider. This server sits between the agent and the wallet and decides what gets paid. Underneath, a [litd](https://github.com/lightninglabs/lightning-terminal) account enforces a spending cap inside lnd, so the limit holds even if the agent bypasses this server.
 
 ```mermaid
 flowchart LR
     Agent[AI agent] -->|MCP| Server[This MCP server]
     Server -->|over the limit?| You[You approve]
-    Server -->|lncli payinvoice| Buyer[lnd: buyer]
+    Server -->|lncli payinvoice| Account["litd account<br/>hard cap, no admin calls"]
+    Account --> Buyer[lnd: buyer]
     Buyer -->|Lightning payment| Seller[lnd: seller]
     Server -->|HTTP + L402 credential| Aperture
     Aperture -->|creates invoices| Seller
@@ -26,7 +27,7 @@ The diagram shows the default lnd demo. The optional Wavelength backend pays Lig
 | [lnd](https://github.com/lightningnetwork/lnd) | v0.21.4-beta | The buyer and seller Lightning nodes. The agent pays through `lncli`. The fallback macaroon lists only the four RPCs the wallet calls ([`scripts/agent-permissions.txt`](scripts/agent-permissions.txt)). |
 | [Aperture](https://github.com/lightninglabs/aperture) | v0.5.0 | The seller's L402 reverse proxy. It answers unpaid requests with a 402, an invoice from the seller's lnd, and a macaroon, then checks credentials and proxies paid requests to the API. |
 | [Lightning Terminal (litd)](https://github.com/lightninglabs/lightning-terminal) | v0.17.7 | The default wallet credential. A litd account caps what its macaroon can spend and refuses node-administration RPCs. lnd enforces it through litd's RPC middleware, even for payments that bypass this server. |
-| [Wavelength](https://github.com/lightninglabs/wavelength) | v0.2.0-rc2 | Optional Ark wallet backend. Live signet payment and preimage verification pass; see the local RC2 acknowledgment fix below. |
+| [Wavelength](https://github.com/lightninglabs/wavelength) | v0.2.0-rc2 | Optional Ark wallet backend. Live signet payment and preimage verification pass; see [docs/wavelength.md](docs/wavelength.md) for setup and the local RC2 acknowledgment fix. |
 
 The rest isn't from Lightning Labs. [btcd](https://github.com/btcsuite/btcd) runs the regtest chain. This project adds the MCP server, the spending policy, the SQLite ledger, the demo seller, and its `/.well-known/l402.json` discovery file. That file is this project's own convention, not part of L402 or Aperture.
 
@@ -42,6 +43,20 @@ The rest isn't from Lightning Labs. [btcd](https://github.com/btcsuite/btcd) run
 The lnd backend uses `lncli`; Wavelength uses `PrepareSend` to obtain a single-use send intent, submits it with `Send`, then polls activity for settlement and a preimage. Wavelength accepts only the Lightning settlement rail for L402, since an in-Ark transfer may not reveal the required preimage.
 
 If the wallet's answer is lost (a crash or a timeout), the payment stays reserved and is not automatically resent. The next `l402_fetch` or `l402_wallet` call checks the backend's payment history. Unknown outcomes keep their reservation; a confirmed failure releases it. A payment reported as settled without a valid preimage is recorded as paid, but cannot produce an L402 credential or trigger automatic repayment.
+
+## A hard ceiling with litd
+
+The MCP spending policy lives in this app, so anything that can read the wallet credential could pay around it. `bun run up` therefore gives the agent a [litd](https://github.com/lightninglabs/lightning-terminal) account macaroon (`.demo/agent-account.macaroon`), not an lnd macaroon. litd runs in remote mode next to the buyer's lnd, which starts with `--rpcmiddleware.enable`, and lnd enforces the account on every call made with it:
+
+- Payments, including fees, cannot exceed the account's remaining allowance (`L402_ACCOUNT_SATS`, default 20,000 sats) or happen after it expires (`L402_ACCOUNT_DAYS`, default 30).
+- RPCs outside litd's account allowlist are refused, so the credential cannot delete payment history, change channel policy, intercept HTLCs, or send on-chain.
+
+The MCP policy still decides what is paid automatically, what needs approval, and the daily and task budgets; the account is the ceiling beneath it. `bun run verify:local` checks that both agent credentials are refused node-administration calls, and `bun run verify:litd` checks the allowance with payments that bypass the MCP server. For a subscription, size an account at the per-period amount × the number of periods, and let it expire when the subscription ends:
+
+```sh
+litcli accounts create <sats> --expiration_date <unix> --save_to <file>
+export L402_LND_MACAROON=<file>
+```
 
 ## Try it
 
@@ -114,19 +129,13 @@ Pass `quality` to `l402_fetch` to check required JSON fields and/or data freshne
 }
 ```
 
-Required fields use dot-separated paths, including array indices such as `items.0.price`. Each must exist as an own property and be non-null; zero, false, and empty strings are valid. These are presence checks, not type or value checks. Freshness requires an ISO timestamp with an explicit timezone (`Z` or an offset); the field defaults to `as_of`. Missing, invalid, future, or older-than-allowed timestamps fail. Age is measured when the body is read; the exact maximum age is accepted. The provider supplies the timestamp, so passing does not establish factual accuracy or independent provenance.
-
 Fetch results include `quality.status`, `quality.usable`, the requirements, check time, failure reasons, and data age when available:
 
 - `passed` / `true`: HTTP succeeded and all requested checks passed.
 - `failed` / `false`: a check failed, HTTP failed, or the response could not be read.
 - `not_checked` / `null`: HTTP succeeded but no quality checks were requested.
 
-`resource_delivered` still describes successful HTTP/body delivery. A response can have `paid: true` and `resource_delivered: true` but `quality.usable: false`. The bundled fixed-market snapshot will fail a short freshness window; its timestamp is preserved rather than replaced with the current time.
-
-Each authenticated response attempt, including credential reuse and failed delivery, gets a `response_check_id` and an append-only assessment linked to its payment hash (when known) and the current fetch's task ID. `l402_task.response_checks` shows that task's history; `l402_wallet.recent_response_checks` shows the latest eight assessments. The records store metadata and check results, not response bodies or credentials. Legacy credentials may lack a payment hash, and historical purchases or crashes before recording an assessment have no inferred quality result. Free responses are checked and returned but are not stored in paid-response history.
-
-Quality failures do not refund spending, release settled charges, invalidate credentials, or authorize another payment. Later calls may reuse the credential and assess a different response; earlier assessments and payment receipts remain unchanged.
+Field-path rules, freshness parsing, and how assessments are stored are in [docs/response-quality.md](docs/response-quality.md). Quality failures never refund spending, invalidate credentials, or authorize another payment.
 
 ## Configuration
 
@@ -157,79 +166,11 @@ All limits include the maximum routing fee. Settled spending is counted on its U
 
 On the seller side, set `timeout` (in seconds) and a fixed `price` on the [Aperture](https://github.com/lightninglabs/aperture) service. Aperture v0.5.0 ignores `timeout` for services that use `dynamicprice` or have no `price`, so their credentials never expire. This is [fixed upstream](https://github.com/lightninglabs/aperture/commit/771f371ba5dcd4f11b864b0caa4ae5c233d9cc4a) but not yet released.
 
-## A hard ceiling with litd
-
-The MCP spending policy lives in this app, so anything that can read the wallet credential could pay around it. `bun run up` therefore gives the agent a [litd](https://github.com/lightninglabs/lightning-terminal) account macaroon (`.demo/agent-account.macaroon`), not an lnd macaroon. litd runs in remote mode next to the buyer's lnd, which starts with `--rpcmiddleware.enable`, and lnd enforces the account on every call made with it:
-
-- Payments, including fees, cannot exceed the account's remaining allowance (`L402_ACCOUNT_SATS`, default 20,000 sats) or happen after it expires (`L402_ACCOUNT_DAYS`, default 30).
-- RPCs outside litd's account allowlist are refused, so the credential cannot delete payment history, change channel policy, intercept HTLCs, or send on-chain.
-
-The MCP policy still decides what is paid automatically, what needs approval, and the daily and task budgets; the account is the ceiling beneath it. `bun run verify:local` checks that both agent credentials are refused node-administration calls, and `bun run verify:litd` checks the allowance with payments that bypass the MCP server. For a subscription, size an account at the per-period amount × the number of periods, and let it expire when the subscription ends:
-
-```sh
-litcli accounts create <sats> --expiration_date <unix> --save_to <file>
-export L402_LND_MACAROON=<file>
-```
-
 ## Wallets
 
 - **lnd** (default): the adapter passes `--network=regtest` and, by default, connects through litd (`127.0.0.1:8443`) with the agent's account macaroon. `L402_LND_RPCSERVER`, `L402_LND_TLSCERT`, and `L402_LND_MACAROON` override the connection and credential paths; for example, `127.0.0.1:10019`, `.demo/buyer/tls.cert`, and `.demo/agent-pay.macaroon` pay directly through lnd with the four-RPC macaroon and no account ceiling.
-- **Wavelength**: set `L402_WALLET=wavelength`, `WAVELENGTH_URL`, and `WAVELENGTH_MACAROON_PATH`. RC2's built-in HTTP gateway uses `http://127.0.0.1:10031`; the daemon's TLS certificate is for its separate gRPC listener. The adapter polls for up to 90 seconds after submission; a timeout leaves the payment unresolved for later reconciliation.
+- **Wavelength**: set `L402_WALLET=wavelength`, `WAVELENGTH_URL`, and `WAVELENGTH_MACAROON_PATH`. RC2's built-in HTTP gateway uses `http://127.0.0.1:10031`; the daemon's TLS certificate is for its separate gRPC listener. The adapter polls for up to 90 seconds after submission; a timeout leaves the payment unresolved for later reconciliation. Setup, TLS trust, signet verification, and the local RC2 patch are in [docs/wavelength.md](docs/wavelength.md).
 
-### TLS trust configuration
-
-[`bunfig.toml`](bunfig.toml) configures a bundled public CA file for package installation and loads [`tools/security/tls-preload.mjs`](tools/security/tls-preload.mjs) for runtime TLS. The preload sets the default CA list and supplies the bundled CA file to `fetch` and WebSocket connections that do not name their own CA.
-
-A request that passes its own `tls.ca` keeps it. The Wavelength adapter does this with `WAVELENGTH_TLS_CERT`, so a private or self-signed HTTPS gateway trusts only that certificate. [`tools/security/tls-preload.test.ts`](tools/security/tls-preload.test.ts) checks this under the preload against a self-signed local gateway. The verified signet setup still uses the loopback HTTP gateway; HTTPS was checked only against that local test gateway.
-
-### Checking Wavelength RC2
-
-Build the pinned daemon and CLI with the wallet API and swap runtime enabled:
-
-```sh
-bun run build:wavelength
-```
-
-Use a separate signet wallet, following the [Wavelength setup guide](https://github.com/lightninglabs/wavelength/blob/v0.2.0-rc2/docs/daemon_cli_guide.md). Keep its HTTP gateway on loopback. The agent needs only `PrepareSend`, `Send`, `List`, and `Balance`; the verification command also needs `GetInfo`. Bake a scoped credential after creating and unlocking the test wallet:
-
-```sh
-# WAVE_DIR is the data directory of your running signet waved instance.
-.bin/wavecli --network=signet --datadir="$WAVE_DIR" bakemacaroon \
-  uri:/waverpc.DaemonService/GetInfo \
-  uri:/wavewalletrpc.WalletService/PrepareSend \
-  uri:/wavewalletrpc.WalletService/Send \
-  uri:/wavewalletrpc.WalletService/List \
-  uri:/wavewalletrpc.WalletService/Balance \
-  --save-to="$WAVE_DIR/agent.macaroon"
-
-export WAVELENGTH_URL=http://127.0.0.1:10031
-export WAVELENGTH_MACAROON_PATH="$WAVE_DIR/agent.macaroon"
-bun run verify:wavelength
-```
-
-This checks the actual daemon version and test network, authentication, balance, activity lookup, and malformed-invoice rejection. Optionally set `WAVELENGTH_IN_ARK_INVOICE_FILE` to a text file containing an invoice from `wavecli recv --offchain` on the same Ark to check that the adapter refuses a payment without a confirmed Lightning settlement rail.
-
-For signet funding, `wavecli recv --onchain` returns a boarding address accepted by the [faucet linked from Wavelength’s network guide](https://robinet.eldamar.icu/). Keep `waved` running while the deposit confirms and joins the operator’s scheduled batch; an on-chain confirmation alone does not make the balance spendable. Inspect `wavecli ark rounds list` and `wavecli balance`. The public signet operator currently requires Lightning pay swaps of at least 1,000 sats.
-
-To test settlement, fund the wallet with test coins and set `WAVELENGTH_TEST_INVOICE_FILE` to a fresh invoice from an external Lightning receiver on the same test network. Then run `bun run verify:wavelength --pay`. The command caps invoice plus fee reserve at 10,000 sats (`WAVELENGTH_TEST_MAX_SATS` overrides this), allows at most 10 sats in fees, verifies the preimage against the payment hash, and reconciles the payment through activity history. It refuses mainnet. Server-credit spending and top-ups remain disabled.
-
-Verified on 2026-10-21: a fresh 1,500-sat payment settled with a 1-sat fee entirely on RC2 `952e6ca` with the local acknowledgment patch applied. Preimage verification, completed payment history, and reconciliation after restarting the same binary passed. Incoming change reached `ReceiveCompleted` without the protobuf error. Authentication and input-rejection checks also passed. See the [verification record](patches/README.md) for hashes, earlier refunds, and balance reconciliation.
-
-This validates the Wavelength wallet adapter against a live signet daemon. It does not establish a complete signet MCP → Aperture → paid HTTP resource flow; the full HTTP purchase flow is exercised separately on local regtest with lnd.
-
-RC2 also sends an internal OOR acknowledgment over REST despite having no corresponding RPC. This produces the protobuf `SendIncomingAckRequest` error independently of Lightning settlement. The optional [local patch](patches/README.md) fixes that path and includes a regression test:
-
-```sh
-WAVELENGTH_RC2_ACK_FIX=1 bun run build:wavelength
-# Run .bin/waved-rc2-local with your existing test-wallet arguments.
-```
-
-After a timeout, inspect `wavecli activity --kind send` and keep the daemon running for settlement/recovery. A timeout is not proof of failure. To verify a previously submitted payment without sending another one:
-
-```sh
-WAVELENGTH_TEST_PAYMENT_HASH=77c1eda91eea1525f08e8a1bee6e07b4565b93f44ca68843b12500d345f8b2e2 \
-  bun run verify:wavelength --reconcile
-```
 
 ## Testing
 
@@ -241,7 +182,7 @@ bun run verify:litd                       # litd account limits
 
 The test-network checks use fixed ports, so run one at a time.
 
-`verify:local` includes `scripts/task-smoke.ts`: it checks previews against independent invoice/payment counts, fee-inclusive task refusals, actual-cost receipts, persistence after restarting MCP, free credential reuse, the shared daily limit, and response quality failures without repayment. Buyer payment proofs and seller invoices are reconciled independently. Verified on local regtest on 2026-10-21: an 80-sat preview settled as 60 sats with zero routing fees, leaving 20 sats in both the task and daily budgets. Preview and credential reuse created no new invoices or payments.
+`verify:local` first runs `scripts/macaroon-scope.ts`: the baked agent macaroon must list exactly the RPCs in `scripts/agent-permissions.txt`, and on a live node both agent credentials must be refused `deletepayments`, `updatechanpolicy`, and `sendcoins`. It also includes `scripts/task-smoke.ts`: it checks previews against independent invoice/payment counts, fee-inclusive task refusals, actual-cost receipts, persistence after restarting MCP, free credential reuse, the shared daily limit, and response quality failures without repayment. Buyer payment proofs and seller invoices are reconciled independently. Verified on local regtest on 2026-10-21: an 80-sat preview settled as 60 sats with zero routing fees, leaving 20 sats in both the task and daily budgets. Preview and credential reuse created no new invoices or payments.
 
 Not tested: mainnet payments, disk or power loss (process crashes are tested), subscription periods longer than seconds, and a litd account expiring mid-payment.
 
@@ -250,6 +191,7 @@ Not tested: mainnet payments, disk or power loss (process crashes are tested), s
 - This is a local tool for one user, not a hosted service.
 - Paying doesn't guarantee a useful response.
 - Separate state directories don't share a budget.
+- With the Wavelength backend there is no wallet-side ceiling; litd accounts cap only the lnd backend.
 - Retrying a POST can run the provider's operation twice.
 - Provider and discovery responses are limited to 64 KiB. Redirects are rejected; provider requests time out after 15 seconds and discovery after 5 seconds.
 - Invoice destinations are compared with a manifest's advertised node when the wallet exposes a destination. Wavelength's preview does not expose it, so that check is unavailable for this backend. A provider's own manifest is not independent identity verification.

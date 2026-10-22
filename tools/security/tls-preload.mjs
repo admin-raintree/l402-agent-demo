@@ -31,8 +31,12 @@ setDefaultCACertificates(certificates);
 
 const nativeFetch = globalThis.fetch;
 
+// A request that names its own CA (for example a self-signed wallet gateway)
+// keeps it; every other request trusts only the vetted bundle.
+const withCA = (tls) => ({ ...tls, ca: tls?.ca ?? ca });
+
 globalThis.fetch = Object.assign(
-	(input, init) => nativeFetch(input, { ...init, tls: { ...init?.tls, ca } }),
+	(input, init) => nativeFetch(input, { ...init, tls: withCA(init?.tls) }),
 	{ preconnect: nativeFetch.preconnect },
 );
 
@@ -45,6 +49,6 @@ globalThis.WebSocket = class extends NativeWebSocket {
 				? protocols
 				: { protocols };
 
-		super(url, { ...options, tls: { ...options.tls, ca } });
+		super(url, { ...options, tls: withCA(options.tls) });
 	}
 };

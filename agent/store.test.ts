@@ -100,6 +100,7 @@ test("100,000 seeded fault sequences match an independent allowance model", () =
 				if (fault >= 2) expect(() => store.reserve(purchase(id, amount), 100, policy, clock)).toThrow();
 			} else expect(() => store.reserve(candidate, 100, limits, clock)).toThrow();
 			expect(spentToday(store.ledger(), clock)).toBe(total());
+			expect(store.spentToday(clock)).toBe(total());
 			expect(total()).toBeLessThanOrEqual(100);
 		}
 	}
@@ -217,3 +218,26 @@ test("independent processes cannot reserve the same task budget twice", async ()
 		expect(results.filter(r=>r==='reserved')).toHaveLength(1); expect(store.taskSummary("task").reserved_sat).toBe(30);
 	} finally { store.close(); rmSync(dir, {recursive:true,force:true}); }
 });
+
+test("indexed queries match full scans of the ledger and purchases", () => fixture(store => {
+	const ids = ["31", "32", "33", "34"].map(n => n.repeat(32));
+	store.createTask({ id: "task", name: "Report", budget_sats: 500, created_at: now.toISOString() });
+	store.reserve({ ...purchase(ids[0]), task_id: "task" }, 100, policy, now);
+	store.reserve(purchase(ids[1]), 100, policy, now);
+	store.reserve(purchase(ids[2]), 100, policy, now);
+	store.finish(ids[1], "failed", now);
+	store.finish(ids[2], { feeSat: 1 }, now); // settled without proof: still unresolved
+	store.record({ ts: now.toISOString(), url: "https://provider.test/x", service: "x", amount_sat: 5, fee_sat: 0,
+		payment_hash: ids[3], approval: "none", outcome: "declined", reason: "declined", task_id: "task" });
+	for (const at of [now, tomorrow]) expect(store.spentToday(at)).toBe(spentToday(store.ledger(), at));
+	expect(store.reservedSat()).toBe(30);
+	expect(store.unresolved().map(p => p.payment_hash).sort()).toEqual(store.purchases()
+		.filter(p => p.outcome === "pending" || (p.outcome === "paid" && !p.proof_of_payment)).map(p => p.payment_hash).sort());
+	expect(store.unresolved()).toHaveLength(2);
+	expect(store.purchase(ids[2])).toEqual(store.purchases().find(p => p.payment_hash === ids[2]));
+	expect(store.purchase("missing")).toBeUndefined();
+	expect(store.forKey(ids[1])).toBeUndefined(); // failed purchases never block a new one
+	expect(store.forKey(ids[2])?.payment_hash).toBe(ids[2]);
+	expect(store.recentReceipts(2)).toEqual(store.ledger().slice(-2));
+	expect(store.taskSummary("task").receipts).toEqual(store.ledger().filter(r => r.task_id === "task"));
+}));

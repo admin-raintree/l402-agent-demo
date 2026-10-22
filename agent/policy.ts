@@ -47,6 +47,9 @@ export function decide(amountSats: number, maxSats: number, spent: number, polic
 	return { kind: "pay" };
 }
 
+/** BOLT 11 mainnet invoices start with `lnbc`; regtest's `lnbcrt` shares the prefix. Case-insensitive, as invoices may be uppercase. */
+export const isMainnetInvoice = (invoice: string) => /^lnbc(?!rt)/i.test(invoice.trim());
+
 /** Parse `WWW-Authenticate: L402 macaroon="…", invoice="…"` (LSAT is the legacy name). */
 export function parseChallenge(header: string | null): { macaroon: string; invoice: string } | undefined {
 	const m = header?.match(/(?:L402|LSAT) macaroon="([^"]+)", ?invoice="([^"]+)"/);

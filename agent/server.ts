@@ -7,7 +7,7 @@ import { resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { decide, parseChallenge, type Receipt, spentToday } from "./policy";
+import { decide, isMainnetInvoice, parseChallenge, type Receipt } from "./policy";
 import { PaymentFailed, walletFromEnv } from "./wallet";
 import { Store, type Purchase } from "./store";
 import { credentialExpiry, periodAt, periodKey, periodStart, subscriptionState, type Subscription } from "./subscription";
@@ -16,6 +16,8 @@ const ROOT = resolve(import.meta.dir, "..");
 const DEMO = process.env.L402_DEMO_DIR ?? resolve(ROOT, ".demo");
 const STATE = process.env.L402_STATE_DIR ?? resolve(DEMO, "agent");
 const FEE_LIMIT_SATS = 10;
+// Mainnet is untested; real-money invoices are refused unless explicitly allowed.
+const ALLOW_MAINNET = process.env.L402_ALLOW_MAINNET === "1";
 const policy = {
 	autoApproveSats: Number(process.env.L402_AUTO_APPROVE_SATS ?? 100),
 	dailyBudgetSats: Number(process.env.L402_DAILY_BUDGET_SATS ?? 5000),
@@ -38,8 +40,8 @@ const json = (value: unknown) => ({ content: [{ type: "text" as const, text: JSO
 const wallet = walletFromEnv(ROOT, DEMO);
 
 async function reconcile() {
-	for (const p of store.purchases()) {
-		if ((p.outcome !== "pending" && !(p.outcome === "paid" && !p.proof_of_payment)) || p.wallet !== wallet.name) continue;
+	for (const p of store.unresolved()) {
+		if (p.wallet !== wallet.name) continue;
 		try {
 			const status = await wallet.lookup(p.quote);
 			if (status.state === "paid") store.finish(p.payment_hash, status.result);
@@ -174,7 +176,7 @@ server.registerTool("l402_preview", {
 	annotations: { readOnlyHint: true, openWorldHint: true },
 }, async ({ task_id, purchases }) => {
 	const task = task_id ? store.taskSummary(task_id) : undefined;
-	const dailyRemaining = Math.max(0, policy.dailyBudgetSats - spentToday(store.ledger()));
+	const dailyRemaining = Math.max(0, policy.dailyBudgetSats - store.spentToday());
 	const discovered = new Map<string, Manifest | undefined>();
 	const items = [];
 	for (const item of purchases) {
@@ -325,6 +327,9 @@ server.registerTool(
 		if (first.status !== 402) return respond(first, null);
 		const challenge = parseChallenge(first.headers.get("www-authenticate"));
 		if (!challenge) return json({ status: 402, paid: false, error: "402 response without an L402 challenge" });
+		if (isMainnetInvoice(challenge.invoice) && !ALLOW_MAINNET)
+			return json({ status: 402, paid: false, outcome: "refused",
+				reason: "mainnet invoice refused: this wallet is tested only on test networks (set L402_ALLOW_MAINNET=1 to override)" });
 		const quote = await wallet.quote(challenge.invoice, FEE_LIMIT_SATS);
 		if (!/^[0-9a-f]{64}$/.test(quote.paymentHash)) throw new Error("wallet returned an invalid payment hash");
 		const base = { ts: new Date().toISOString(), task_id, url: url.href, service, wallet: wallet.name,
@@ -337,7 +342,7 @@ server.registerTool(
 		if (expectedNode && quote.destination && quote.destination !== expectedNode)
 			return stop("refused", "invoice pays a different node than the provider's manifest names");
 		const maxSats = standing ? Math.min(max_sats, standing.sub.capSat) : max_sats;
-		const spent = spentToday(store.ledger());
+		const spent = store.spentToday();
 		const decision = decide(base.amount_sat, maxSats, spent, policy, FEE_LIMIT_SATS);
 		if (decision.kind === "refuse") return stop("refused", decision.reason);
 		const taskRefusal = store.checkTask(task_id, base.amount_sat + FEE_LIMIT_SATS);
@@ -363,14 +368,14 @@ server.registerTool(
 			// Transport failures may follow a successful send; only wallet evidence can release the reservation.
 			await reconcile();
 		}
-		const settled = store.purchases().find(p => p.payment_hash === quote.paymentHash)!;
+		const settled = store.purchase(quote.paymentHash)!;
 		const credential = store.token(key);
 		if (!credential) return paymentState(settled);
 		return deliver(credential, { task_id, wallet: wallet.name, amount_sat: settled.amount_sat, fee_sat: settled.fee_sat,
 			approval: settled.approval, payment_hash: settled.payment_hash,
 			...(standing ? { subscription_id: standing.sub.id, period: standing.period,
 				valid_until: (v => v ? new Date(v * 1000).toISOString() : null)(credentialExpiry(credential)) } : {}),
-			spent_today_sat: spentToday(store.ledger()), daily_budget_sat: policy.dailyBudgetSats });
+			spent_today_sat: store.spentToday(), daily_budget_sat: policy.dailyBudgetSats });
 	}),
 );
 
@@ -457,8 +462,7 @@ server.registerTool(
 	},
 	async () => {
 		await reconcile();
-		const ledger = store.ledger();
-		const spent = spentToday(ledger);
+		const spent = store.spentToday();
 		return json({
 			policy: { auto_approve_sats: policy.autoApproveSats, daily_budget_sats: policy.dailyBudgetSats, fee_limit_sats: FEE_LIMIT_SATS },
 			spent_today_sat: spent,
@@ -466,8 +470,8 @@ server.registerTool(
 			wallet: wallet.name,
 			balance_sat: await wallet.balanceSat(),
 			recent_response_checks: store.responseChecks(),
-			recent_receipts: ledger.slice(-8).map(r => ({ ts: r.ts, task_id: r.task_id, url: r.url, service: r.service, amount_sat: r.amount_sat, fee_sat: r.fee_sat, payment_hash: r.payment_hash, approval: r.approval, outcome: r.outcome, reason: r.reason, proof_of_payment: r.proof_of_payment })),
-			reserved_sat: ledger.filter(r => r.outcome === "pending").reduce((sum, r) => sum + r.amount_sat + r.fee_sat, 0),
+			recent_receipts: store.recentReceipts(8).map(r => ({ ts: r.ts, task_id: r.task_id, url: r.url, service: r.service, amount_sat: r.amount_sat, fee_sat: r.fee_sat, payment_hash: r.payment_hash, approval: r.approval, outcome: r.outcome, reason: r.reason, proof_of_payment: r.proof_of_payment })),
+			reserved_sat: store.reservedSat(),
 		});
 	},
 );

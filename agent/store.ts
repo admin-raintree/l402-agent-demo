@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import { decide, type Policy, type Receipt, spentToday } from "./policy";
+import { decide, type Policy, type Receipt } from "./policy";
 import { periodAt, periodKey, subscriptionState, type Subscription } from "./subscription";
 import type { ResponseCheck } from "./quality";
 import type { Paid, Quote } from "./wallet";
@@ -31,7 +31,12 @@ export class Store {
 			CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, data TEXT NOT NULL);
 			CREATE TABLE IF NOT EXISTS subscriptions (id TEXT PRIMARY KEY, data TEXT NOT NULL);
 			CREATE TABLE IF NOT EXISTS renewals (subscription_id TEXT NOT NULL, period INTEGER NOT NULL, payment_hash TEXT NOT NULL,
-				PRIMARY KEY (subscription_id, period));`);
+				PRIMARY KEY (subscription_id, period));
+			CREATE INDEX IF NOT EXISTS purchases_key ON purchases(key);
+			CREATE INDEX IF NOT EXISTS purchases_outcome ON purchases(json_extract(data, '$.outcome'));
+			CREATE INDEX IF NOT EXISTS purchases_subscription ON purchases(json_extract(data, '$.subscription.id'), json_extract(data, '$.subscription.period'));
+			CREATE INDEX IF NOT EXISTS receipts_outcome_day ON receipts(json_extract(data, '$.outcome'), substr(json_extract(data, '$.ts'), 1, 10));
+			CREATE INDEX IF NOT EXISTS receipts_task ON receipts(json_extract(data, '$.task_id'));`);
 		this.db.transaction(() => {
 			if (this.db.query("SELECT key FROM metadata WHERE key='imported'").get()) return;
 			const ledger = join(dir, "receipts.jsonl");
@@ -63,8 +68,34 @@ export class Store {
 	purchases(): Purchase[] {
 		return (this.db.query("SELECT data FROM purchases").all() as { data: string }[]).map(r => JSON.parse(r.data));
 	}
+	purchase(hash: string): Purchase | undefined {
+		const row = this.db.query("SELECT data FROM purchases WHERE hash=?").get(hash) as { data: string } | null;
+		return row ? JSON.parse(row.data) : undefined;
+	}
 	forKey(key: string): Purchase | undefined {
-		return this.purchases().find(p => p.key === key && p.outcome !== "failed");
+		return (this.db.query("SELECT data FROM purchases WHERE key=?").all(key) as { data: string }[])
+			.map(r => JSON.parse(r.data) as Purchase).find(p => p.outcome !== "failed");
+	}
+	/** Purchases that still need wallet evidence: pending, or settled without a valid proof. */
+	unresolved(): Purchase[] {
+		return (this.db.query(`SELECT data FROM purchases WHERE json_extract(data, '$.outcome') = 'pending'
+			OR (json_extract(data, '$.outcome') = 'paid' AND NOT coalesce(json_extract(data, '$.proof_of_payment'), 0))`).all() as { data: string }[])
+			.map(r => JSON.parse(r.data));
+	}
+	/** Same total as policy.spentToday(ledger, now), computed in SQLite. */
+	spentToday(now = new Date()): number {
+		return (this.db.query(`SELECT coalesce(sum(json_extract(data, '$.amount_sat') + json_extract(data, '$.fee_sat')), 0) AS n FROM receipts
+			WHERE json_extract(data, '$.outcome') = 'pending'
+				OR (json_extract(data, '$.outcome') = 'paid' AND substr(json_extract(data, '$.ts'), 1, 10) = ?)`)
+			.get(now.toISOString().slice(0, 10)) as { n: number }).n;
+	}
+	reservedSat(): number {
+		return (this.db.query(`SELECT coalesce(sum(json_extract(data, '$.amount_sat') + json_extract(data, '$.fee_sat')), 0) AS n FROM receipts
+			WHERE json_extract(data, '$.outcome') = 'pending'`).get() as { n: number }).n;
+	}
+	recentReceipts(limit: number): Receipt[] {
+		return (this.db.query("SELECT data FROM receipts ORDER BY id DESC LIMIT ?").all(limit) as { data: string }[])
+			.map(r => JSON.parse(r.data)).reverse();
 	}
 	token(key: string): string | undefined {
 		return (this.db.query("SELECT value FROM tokens WHERE key=?").get(key) as { value: string } | null)?.value;
@@ -90,7 +121,8 @@ export class Store {
 	}
 	taskSummary(id: string) {
 		const task = this.task(id);
-		const receipts = this.ledger().filter(r => r.task_id === id);
+		const receipts = (this.db.query("SELECT data FROM receipts WHERE json_extract(data, '$.task_id') = ? ORDER BY id").all(id) as { data: string }[])
+			.map(r => JSON.parse(r.data) as Receipt);
 		const cost = (outcome: Receipt["outcome"]) => receipts.filter(r => r.outcome === outcome)
 			.reduce((sum, r) => sum + r.amount_sat + r.fee_sat, 0);
 		const settled = cost("paid"), reserved = cost("pending");
@@ -142,8 +174,10 @@ export class Store {
 		}
 	}
 	periodSpent(id: string, period: number) {
-		return this.purchases().filter(p => p.subscription?.id === id && p.subscription.period === period &&
-			(p.outcome === "paid" || p.outcome === "pending")).reduce((n, p) => n + p.amount_sat + p.fee_sat, 0);
+		return (this.db.query(`SELECT data FROM purchases WHERE json_extract(data, '$.subscription.id') = ?
+			AND json_extract(data, '$.subscription.period') = ?`).all(id, period) as { data: string }[])
+			.map(r => JSON.parse(r.data) as Purchase).filter(p => p.outcome === "paid" || p.outcome === "pending")
+			.reduce((n, p) => n + p.amount_sat + p.fee_sat, 0);
 	}
 	private checkSubscription(p: Purchase, now: Date) {
 		if (!p.subscription) return;
@@ -169,11 +203,13 @@ export class Store {
 			if (p.approval === "standing" && !p.subscription) throw new Error("standing approval requires a subscription");
 			if (this.forKey(p.key) || this.db.query("SELECT hash FROM purchases WHERE hash=?").get(p.payment_hash))
 				throw new Error("purchase already recorded; reconcile it before retrying");
-			const ledger = this.ledger();
-			if (ledger.some(r => (r.outcome === "paid" || r.outcome === "pending") &&
+			// Only paid and pending receipts can block a repayment; legacy imports exist only as receipts.
+			const charged = (this.db.query(`SELECT data FROM receipts WHERE json_extract(data, '$.outcome') IN ('paid', 'pending')`)
+				.all() as { data: string }[]).map(r => JSON.parse(r.data) as Receipt);
+			if (charged.some(r =>
 				(r.payment_hash === p.payment_hash || `${new URL(r.url).origin} ${r.service}` === p.key)))
 				throw new Error("previous payment exists for this service; automatic repayment blocked");
-			const d = decide(p.amount_sat, maxSats, spentToday(ledger, now), policy, p.fee_limit_sat);
+			const d = decide(p.amount_sat, maxSats, this.spentToday(now), policy, p.fee_limit_sat);
 			if (d.kind === "refuse") throw new Error(d.reason);
 			if (d.kind === "ask" && p.approval !== "human" && !p.subscription) throw new Error("human approval required");
 			const taskRefusal = this.checkTask(p.task_id, p.amount_sat + p.fee_limit_sat);

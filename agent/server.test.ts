@@ -23,6 +23,7 @@ async function setup() {
 	let blockLookup = false;
 	let lookupStarted = false;
 	let rail = "SEND_RAIL_LIGHTNING";
+	let invoice = "invoice";
 	let sendStarted: (() => void) | undefined;
 	let releaseSend: (() => void) | undefined;
 	const proof = "11".repeat(32);
@@ -37,7 +38,7 @@ async function setup() {
 				if (failResource) return new Response(null, { status: 302, headers: { location: "http://127.0.0.1:1" } });
 				return new Response(responseBody, { status: responseStatus });
 			}
-			return new Response("pay", { status: 402, headers: { "www-authenticate": 'L402 macaroon="macaroon", invoice="invoice"' } });
+			return new Response("pay", { status: 402, headers: { "www-authenticate": `L402 macaroon="macaroon", invoice="${invoice}"` } });
 		}
 		if (path.endsWith("/prepare-send")) { prepares++; return Response.json({ send_intent_id: "intent", amount_sat: String(price), payment_hash: hash, rail }); }
 		if (path.endsWith("/send")) {
@@ -57,11 +58,11 @@ async function setup() {
 		return new Response("missing", { status: 404 });
 	} });
 	const clients: { client: Client; transport: StdioClientTransport }[] = [];
-	async function connect(answer: "approve" | "decline" | "cancel" | "unsupported" | "disconnect" = "approve", budget = 100, auto = 100) {
+	async function connect(answer: "approve" | "decline" | "cancel" | "unsupported" | "disconnect" = "approve", budget = 100, auto = 100, extraEnv: Record<string, string> = {}) {
 		const client = new Client({ name: "fault-test", version: "0" }, { capabilities: answer === "unsupported" ? {} : { elicitation: {} } });
 		const transport = new StdioClientTransport({ command: process.execPath, args: [resolve(import.meta.dir, "server.ts")], stderr: "pipe", env: {
 			...process.env as Record<string, string>, L402_STATE_DIR: dir, L402_WALLET: "wavelength", WAVELENGTH_URL: gateway.url.toString().replace(/\/$/, ""),
-			L402_DAILY_BUDGET_SATS: String(budget), L402_AUTO_APPROVE_SATS: String(auto),
+			L402_DAILY_BUDGET_SATS: String(budget), L402_AUTO_APPROVE_SATS: String(auto), ...extraEnv,
 		} });
 		if (answer !== "unsupported") client.setRequestHandler(ElicitRequestSchema, async () => {
 			if (answer === "disconnect") { process.kill(transport.pid!, "SIGKILL"); throw new Error("client disconnected"); }
@@ -80,7 +81,7 @@ async function setup() {
 		set responseBody(v: string) { responseBody = v; }, set failResource(v: boolean) { failResource = v; },
 		set price(v: number) { price = v; }, set responseStatus(v: number) { responseStatus = v; }, set invalidProof(v: boolean) { invalidProof = v; },
 		set dropResponse(v: boolean) { dropResponse = v; }, set blockSend(v: boolean) { blockSend = v; }, set blockLookup(v: boolean) { blockLookup = v; },
-		set pending(v: boolean) { pending = v; }, set rail(v: string) { rail = v; },
+		set pending(v: boolean) { pending = v; }, set rail(v: string) { rail = v; }, set invoice(v: string) { invoice = v; },
 		onSend: () => new Promise<void>(resolve => { sendStarted = resolve; }),
 		async close() { releaseSend?.(); for (const c of clients) await c.client.close(); gateway.stop(true); rmSync(dir, { recursive: true, force: true }); } };
 }
@@ -313,5 +314,22 @@ test("unconfigured quality remains unknown; invalid requirements send no request
 		expect(f.sends).toBe(0);
 		expect((await a.call()).quality).toMatchObject({ status: "not_checked", usable: null });
 		expect((await a.call("l402_wallet")).recent_response_checks[0].quality.usable).toBeNull();
+	} finally { await f.close(); }
+});
+
+test("mainnet invoices are refused before the wallet sees them unless explicitly allowed", async () => {
+	const f = await setup();
+	try {
+		f.invoice = "lnbc200n1pexample";
+		const a = await f.connect();
+		const refused = await a.call();
+		expect(refused).toMatchObject({ paid: false, outcome: "refused" });
+		expect(refused.reason).toContain("mainnet invoice refused");
+		expect(f.prepares).toBe(0);
+		expect(f.sends).toBe(0);
+		expect((await a.call("l402_wallet")).reserved_sat).toBe(0);
+		const allowed = await f.connect("approve", 100, 100, { L402_ALLOW_MAINNET: "1" });
+		expect((await allowed.call()).resource_delivered).toBe(true);
+		expect(f.sends).toBe(1);
 	} finally { await f.close(); }
 });

@@ -141,6 +141,7 @@ Quality failures do not refund spending, release settled charges, invalidate cre
 | `L402_SELLER_PORT` | `8701` | Demo seller port behind Aperture |
 | `L402_FIXED_MARKET` | unset | Set to `1` to serve the bundled market snapshot |
 | `L402_WALLET` | `lnd` | Wallet backend: `lnd` or `wavelength`; connection settings are below |
+| `L402_ALLOW_MAINNET` | unset | Set to `1` to pay mainnet (`lnbc…`) invoices. Mainnet is untested; they are refused otherwise |
 
 All limits include the maximum routing fee. Settled spending is counted on its UTC settlement day; unresolved reservations do not reset at midnight. `bun run up` won't overwrite a non-empty `L402_DEMO_DIR`; point it at a new directory instead.
 
@@ -176,9 +177,9 @@ litd runs in remote mode next to the buyer's lnd, which must start with `--rpcmi
 
 ### TLS trust configuration
 
-[`bunfig.toml`](bunfig.toml) configures a bundled public CA file for package installation and loads [`tools/security/tls-preload.mjs`](tools/security/tls-preload.mjs) for runtime TLS. The preload sets the default CA list and supplies the bundled CA file to `fetch` and WebSocket connections.
+[`bunfig.toml`](bunfig.toml) configures a bundled public CA file for package installation and loads [`tools/security/tls-preload.mjs`](tools/security/tls-preload.mjs) for runtime TLS. The preload sets the default CA list and supplies the bundled CA file to `fetch` and WebSocket connections that do not name their own CA.
 
-**Current limitation:** although the Wavelength adapter accepts `WAVELENGTH_TLS_CERT` for an HTTPS gateway, the preload overrides that request's custom CA. A private or self-signed HTTPS gateway therefore cannot rely on this option under the repository's default Bun configuration. The verified signet setup uses the loopback HTTP gateway. Custom-CA HTTPS support needs a code fix and verification.
+A request that passes its own `tls.ca` keeps it. The Wavelength adapter does this with `WAVELENGTH_TLS_CERT`, so a private or self-signed HTTPS gateway trusts only that certificate. [`tools/security/tls-preload.test.ts`](tools/security/tls-preload.test.ts) checks this under the preload against a self-signed local gateway. The verified signet setup still uses the loopback HTTP gateway; HTTPS was checked only against that local test gateway.
 
 ### Checking Wavelength RC2
 
@@ -251,4 +252,4 @@ Not tested: mainnet payments, disk or power loss (process crashes are tested), s
 - Retrying a POST can run the provider's operation twice.
 - Provider and discovery responses are limited to 64 KiB. Redirects are rejected; provider requests time out after 15 seconds and discovery after 5 seconds.
 - Invoice destinations are compared with a manifest's advertised node when the wallet exposes a destination. Wavelength's preview does not expose it, so that check is unavailable for this backend. A provider's own manifest is not independent identity verification.
-- The Wavelength verification script rejects mainnet, but the general adapter has no equivalent network check. Mainnet behavior is untested.
+- Mainnet invoices are refused by their BOLT 11 prefix before the wallet is called, for both backends, unless `L402_ALLOW_MAINNET=1`. The check reads the invoice, not the wallet's network. Mainnet behavior is untested.

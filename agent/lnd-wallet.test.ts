@@ -20,10 +20,10 @@ async function argsOf(env: Record<string, string | undefined>) {
 	expect(await lndWallet(root, "/demo", env).balanceSat()).toBe(40);
 	return readFileSync(argsFile, "utf8").trimEnd().split("\n");
 }
-const defaults = ["--network=regtest", "--rpcserver=127.0.0.1:10019",
-	"--tlscertpath=/demo/buyer/tls.cert", "--macaroonpath=/demo/agent-pay.macaroon", "channelbalance"];
+const defaults = ["--network=regtest", "--rpcserver=127.0.0.1:8443",
+	"--tlscertpath=/demo/lit/tls.cert", "--macaroonpath=/demo/agent-account.macaroon", "channelbalance"];
 
-test("without overrides, lncli gets the demo buyer node and pay-only macaroon", async () => {
+test("without overrides, lncli goes through litd with the agent's account macaroon", async () => {
 	expect(await argsOf({})).toEqual(defaults);
 });
 
@@ -31,10 +31,10 @@ test("empty overrides keep the defaults", async () => {
 	expect(await argsOf({ L402_LND_RPCSERVER: "", L402_LND_TLSCERT: "", L402_LND_MACAROON: "" })).toEqual(defaults);
 });
 
-test("overrides point lncli at litd with an account macaroon", async () => {
-	expect(await argsOf({ L402_LND_RPCSERVER: "127.0.0.1:8443", L402_LND_TLSCERT: "/demo/lit/tls.cert",
-		L402_LND_MACAROON: "/demo/sub-account.macaroon" })).toEqual(["--network=regtest",
-		"--rpcserver=127.0.0.1:8443", "--tlscertpath=/demo/lit/tls.cert", "--macaroonpath=/demo/sub-account.macaroon", "channelbalance"]);
+test("overrides point lncli straight at lnd with the scoped macaroon", async () => {
+	expect(await argsOf({ L402_LND_RPCSERVER: "127.0.0.1:10019", L402_LND_TLSCERT: "/demo/buyer/tls.cert",
+		L402_LND_MACAROON: "/demo/agent-pay.macaroon" })).toEqual(["--network=regtest",
+		"--rpcserver=127.0.0.1:10019", "--tlscertpath=/demo/buyer/tls.cert", "--macaroonpath=/demo/agent-pay.macaroon", "channelbalance"]);
 });
 
 test("each override applies on its own", async () => {
@@ -43,10 +43,10 @@ test("each override applies on its own", async () => {
 });
 
 test("walletFromEnv passes the overrides to the lnd backend", async () => {
-	const w = walletFromEnv(root, "/demo", { L402_LND_RPCSERVER: "127.0.0.1:8443" });
+	const w = walletFromEnv(root, "/demo", { L402_LND_RPCSERVER: "127.0.0.1:10019" });
 	expect(w.name).toBe("lnd");
 	await w.balanceSat();
-	expect(readFileSync(argsFile, "utf8")).toContain("--rpcserver=127.0.0.1:8443\n");
+	expect(readFileSync(argsFile, "utf8")).toContain("--rpcserver=127.0.0.1:10019\n");
 });
 
 // A second fake lncli answers from files named after the subcommand (and listpayments' --index_offset),

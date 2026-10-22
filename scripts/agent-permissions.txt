@@ -1,0 +1,4 @@
+uri:/lnrpc.Lightning/DecodePayReq
+uri:/routerrpc.Router/SendPaymentV2
+uri:/lnrpc.Lightning/ListPayments
+uri:/lnrpc.Lightning/ChannelBalance

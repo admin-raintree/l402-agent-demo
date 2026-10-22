@@ -23,9 +23,9 @@ The diagram shows the default lnd demo. The optional Wavelength backend pays Lig
 
 | Component | Version | Role here |
 |---|---|---|
-| [lnd](https://github.com/lightningnetwork/lnd) | v0.21.4-beta | The buyer and seller Lightning nodes. The agent pays through `lncli` with a macaroon limited to `offchain:read`, `offchain:write`, and `info:read`. |
+| [lnd](https://github.com/lightningnetwork/lnd) | v0.21.4-beta | The buyer and seller Lightning nodes. The agent pays through `lncli`. The fallback macaroon lists only the four RPCs the wallet calls ([`scripts/agent-permissions.txt`](scripts/agent-permissions.txt)). |
 | [Aperture](https://github.com/lightninglabs/aperture) | v0.5.0 | The seller's L402 reverse proxy. It answers unpaid requests with a 402, an invoice from the seller's lnd, and a macaroon, then checks credentials and proxies paid requests to the API. |
-| [Lightning Terminal (litd)](https://github.com/lightninglabs/lightning-terminal) | v0.17.7 | Optional. A litd account caps what its macaroon can spend. lnd enforces it through litd's RPC middleware, even for payments that bypass this server. |
+| [Lightning Terminal (litd)](https://github.com/lightninglabs/lightning-terminal) | v0.17.7 | The default wallet credential. A litd account caps what its macaroon can spend and refuses node-administration RPCs. lnd enforces it through litd's RPC middleware, even for payments that bypass this server. |
 | [Wavelength](https://github.com/lightninglabs/wavelength) | v0.2.0-rc2 | Optional Ark wallet backend. Live signet payment and preimage verification pass; see the local RC2 acknowledgment fix below. |
 
 The rest isn't from Lightning Labs. [btcd](https://github.com/btcsuite/btcd) runs the regtest chain. This project adds the MCP server, the spending policy, the SQLite ledger, the demo seller, and its `/.well-known/l402.json` discovery file. That file is this project's own convention, not part of L402 or Aperture.
@@ -49,8 +49,8 @@ Requires [Bun](https://bun.sh) and Go 1.26+. The default payment network runs lo
 
 ```sh
 bun install --frozen-lockfile
-bun run build:binaries   # builds lnd, Aperture, and btcd from source into .bin/
-bun run up               # starts btcd, two lnd nodes, Aperture, and the demo seller in .demo/
+bun run build:binaries   # builds lnd, Aperture, litd, and btcd from source into .bin/
+bun run up               # starts btcd, two lnd nodes, Aperture, the demo seller, and litd in .demo/
 ```
 
 Open Claude Code (or another MCP client) in this directory. It picks up the server from [`.mcp.json`](.mcp.json), which auto-approves up to 100 sats with a 5,000-sat daily budget. Then ask it to:
@@ -141,6 +141,8 @@ Quality failures do not refund spending, release settled charges, invalidate cre
 | `L402_SELLER_PORT` | `8701` | Demo seller port behind Aperture |
 | `L402_FIXED_MARKET` | unset | Set to `1` to serve the bundled market snapshot |
 | `L402_WALLET` | `lnd` | Wallet backend: `lnd` or `wavelength`; connection settings are below |
+| `L402_ACCOUNT_SATS` | `20000` | Lifetime allowance of the agent's litd account, enforced by lnd |
+| `L402_ACCOUNT_DAYS` | `30` | Days until the agent's litd account expires |
 | `L402_ALLOW_MAINNET` | unset | Set to `1` to pay mainnet (`lnbc…`) invoices. Mainnet is untested; they are refused otherwise |
 
 All limits include the maximum routing fee. Settled spending is counted on its UTC settlement day; unresolved reservations do not reset at midnight. `bun run up` won't overwrite a non-empty `L402_DEMO_DIR`; point it at a new directory instead.
@@ -157,22 +159,21 @@ On the seller side, set `timeout` (in seconds) and a fixed `price` on the [Apert
 
 ## A hard ceiling with litd
 
-The MCP spending policy lives in this app. A [litd](https://github.com/lightninglabs/lightning-terminal) account also enforces a wallet-side allowance for payments made with its account macaroon, including calls that bypass the MCP server. Broader lnd credentials remain outside that account's boundary, so the agent must only receive the account credential:
+The MCP spending policy lives in this app, so anything that can read the wallet credential could pay around it. `bun run up` therefore gives the agent a [litd](https://github.com/lightninglabs/lightning-terminal) account macaroon (`.demo/agent-account.macaroon`), not an lnd macaroon. litd runs in remote mode next to the buyer's lnd, which starts with `--rpcmiddleware.enable`, and lnd enforces the account on every call made with it:
+
+- Payments, including fees, cannot exceed the account's remaining allowance (`L402_ACCOUNT_SATS`, default 20,000 sats) or happen after it expires (`L402_ACCOUNT_DAYS`, default 30).
+- RPCs outside litd's account allowlist are refused, so the credential cannot delete payment history, change channel policy, intercept HTLCs, or send on-chain.
+
+The MCP policy still decides what is paid automatically, what needs approval, and the daily and task budgets; the account is the ceiling beneath it. `bun run verify:local` checks that both agent credentials are refused node-administration calls, and `bun run verify:litd` checks the allowance with payments that bypass the MCP server. For a subscription, size an account at the per-period amount × the number of periods, and let it expire when the subscription ends:
 
 ```sh
 litcli accounts create <sats> --expiration_date <unix> --save_to <file>
-
 export L402_LND_MACAROON=<file>
-export L402_LND_RPCSERVER=127.0.0.1:8443
-export L402_LND_TLSCERT="$L402_DEMO_DIR/lit/tls.cert"
 ```
-
-litd runs in remote mode next to the buyer's lnd, which must start with `--rpcmiddleware.enable` (`L402_RPC_MIDDLEWARE=1 bun run up`). Build litd with `bun run build:litd`; `bun run verify:litd` sets all of this up and checks it. For a subscription, size the account at the per-period amount × the number of periods, and let it expire when the subscription ends.
 
 ## Wallets
 
-- **lnd** (default): the adapter passes `--network=regtest`. `L402_LND_RPCSERVER`, `L402_LND_TLSCERT`, and `L402_LND_MACAROON` override the demo buyer connection and credential paths.
-- **litd account**: as above.
+- **lnd** (default): the adapter passes `--network=regtest` and, by default, connects through litd (`127.0.0.1:8443`) with the agent's account macaroon. `L402_LND_RPCSERVER`, `L402_LND_TLSCERT`, and `L402_LND_MACAROON` override the connection and credential paths; for example, `127.0.0.1:10019`, `.demo/buyer/tls.cert`, and `.demo/agent-pay.macaroon` pay directly through lnd with the four-RPC macaroon and no account ceiling.
 - **Wavelength**: set `L402_WALLET=wavelength`, `WAVELENGTH_URL`, and `WAVELENGTH_MACAROON_PATH`. RC2's built-in HTTP gateway uses `http://127.0.0.1:10031`; the daemon's TLS certificate is for its separate gRPC listener. The adapter polls for up to 90 seconds after submission; a timeout leaves the payment unresolved for later reconciliation.
 
 ### TLS trust configuration
@@ -235,7 +236,7 @@ WAVELENGTH_TEST_PAYMENT_HASH=77c1eda91eea1525f08e8a1bee6e07b4565b93f44ca68843b12
 ```sh
 bun test                                  # unit, crash, and concurrency tests
 bun run verify:local                      # real payments, task budgets/previews, and subscriptions
-bun run build:litd && bun run verify:litd # litd account limits
+bun run verify:litd                       # litd account limits
 ```
 
 The test-network checks use fixed ports, so run one at a time.

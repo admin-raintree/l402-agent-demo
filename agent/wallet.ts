@@ -33,15 +33,15 @@ export type Wallet = {
 	lookup(quote: Quote): Promise<PaymentStatus>;
 };
 
-/** Unset or empty L402_LND_* variables keep the demo buyer node and its pay-only macaroon. */
+/** Unset or empty L402_LND_* variables use the demo's litd account macaroon, through litd. */
 // litd's checkSend wraps ErrAccBalanceInsufficient this way, and lncli prints it as a gRPC status.
 // Matching the whole status keeps other output that merely mentions the phrase unresolved.
 const LITD_OVER_BALANCE = /rpc error: code = \w+ desc = error validating account balance: account balance insufficient\s*$/;
 
 export function lndWallet(root: string, demo: string, env: Record<string, string | undefined> = process.env): Wallet {
-	const rpcserver = env.L402_LND_RPCSERVER || "127.0.0.1:10019";
-	const tlscert = env.L402_LND_TLSCERT || `${demo}/buyer/tls.cert`;
-	const macaroon = env.L402_LND_MACAROON || `${demo}/agent-pay.macaroon`;
+	const rpcserver = env.L402_LND_RPCSERVER || "127.0.0.1:8443";
+	const tlscert = env.L402_LND_TLSCERT || `${demo}/lit/tls.cert`;
+	const macaroon = env.L402_LND_MACAROON || `${demo}/agent-account.macaroon`;
 	async function lncli(...args: string[]): Promise<string> {
 		const p = Bun.spawn(
 			[

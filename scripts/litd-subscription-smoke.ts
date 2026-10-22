@@ -189,7 +189,9 @@ try {
 		assert.equal(record?.status, "SUCCEEDED");
 		assert.equal(Number(record!.value_sat), p.amount_sat);
 		assert.equal(Number(record!.fee_sat), p.fee_sat);
-		const status = await lndWallet(ROOT, DEMO).lookup({ paymentHash: p.payment_hash, amountSat: p.amount_sat });
+		// The scoped lnd macaroon sees every buyer payment; litd would filter to the agent account's own.
+		const status = await lndWallet(ROOT, DEMO, { L402_LND_RPCSERVER: "127.0.0.1:10019", L402_LND_TLSCERT: `${DEMO}/buyer/tls.cert`,
+			L402_LND_MACAROON: `${DEMO}/agent-pay.macaroon` }).lookup({ paymentHash: p.payment_hash, amountSat: p.amount_sat });
 		assert(status.state === "paid");
 		assert.equal(createHash("sha256").update(Buffer.from(status.result.preimage!, "hex")).digest("hex"), p.payment_hash);
 		const inv = await invoiceState(p.payment_hash);

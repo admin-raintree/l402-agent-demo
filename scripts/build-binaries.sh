@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build btcd, lnd, and Aperture from pinned source tags into .bin/. Pure Go, no Docker or Xcode.
+# Build btcd, lnd, Aperture, and litd from pinned source tags into .bin/. Pure Go, no Docker or Xcode.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="${SRC:-$HOME/Code/scratch/lightning-builds}"
@@ -21,4 +21,5 @@ clone https://github.com/lightninglabs/aperture.git aperture v0.5.0
 (cd "$SRC/btcd" && go install . ./cmd/btcctl)
 (cd "$SRC/lnd-v0.21.4-beta" && go install -tags="signrpc walletrpc chainrpc invoicesrpc routerrpc peersrpc" ./cmd/lnd ./cmd/lncli)
 (cd "$SRC/aperture" && go install ./cmd/aperture)
+"$ROOT/scripts/build-litd.sh"
 ls "$GOBIN"

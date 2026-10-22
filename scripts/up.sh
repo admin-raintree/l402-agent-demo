@@ -11,6 +11,9 @@ D="${L402_DEMO_DIR:-$ROOT/.demo}"
 export L402_DEMO_DIR="$D"
 export PATH="$BIN:$PATH"
 
+ACCOUNT_SATS="${L402_ACCOUNT_SATS:-20000}"
+ACCOUNT_DAYS="${L402_ACCOUNT_DAYS:-30}"
+[ -x "$BIN/litd" ] && [ -x "$BIN/litcli" ] || { echo "litd is missing: run bun run build:binaries (or scripts/build-litd.sh)." >&2; exit 1; }
 if [ -d "$D" ] && [ -n "$(ls -A "$D")" ]; then
   echo "Refusing to overwrite existing state: $D. Set L402_DEMO_DIR to a new empty directory." >&2
   exit 1
@@ -39,9 +42,9 @@ mine() { ctl generate "$1"; }
 
 # name rpc-port p2p-port
 lnd_start() {
-  # L402_RPC_MIDDLEWARE=1 lets litd attach its account interceptor to the buyer node.
+  # The buyer accepts RPC middleware so litd's account interceptor can cap the agent's spending.
   local extra=()
-  [ "$1" = buyer ] && [ "${L402_RPC_MIDDLEWARE:-}" = 1 ] && extra+=(--rpcmiddleware.enable)
+  [ "$1" = buyer ] && extra+=(--rpcmiddleware.enable)
   lnd --lnddir="$D/$1" --bitcoin.regtest --bitcoin.node=btcd \
     --btcd.rpchost="127.0.0.1:$BTC_RPC_PORT" --btcd.rpcuser=demo --btcd.rpcpass=demo --btcd.rpccert="$D/btcd/rpc.cert" \
     --noseedbackup --norest --rpclisten="127.0.0.1:$2" --listen="127.0.0.1:$3" \
@@ -88,8 +91,9 @@ channel_active() { buyer listchannels --active_only | bun -e 'process.exit((awai
 wait_for "channel to open" channel_active
 wait_for "payment route" buyer queryroutes --dest="$SELLER_PUBKEY" --amt=1000 --fee_limit=10
 
-# Least privilege: the agent's MCP server gets a macaroon that can read and pay invoices, nothing else.
-buyer bakemacaroon offchain:read offchain:write info:read --save_to="$D/agent-pay.macaroon" >/dev/null
+# Least privilege: only the four RPCs the lnd wallet calls. Entity permissions such as offchain:write
+# would also grant DeleteAllPayments, UpdateChannelPolicy, HtlcInterceptor, and AbandonChannel.
+buyer bakemacaroon $(cat "$ROOT/scripts/agent-permissions.txt") --save_to="$D/agent-pay.macaroon" >/dev/null
 
 echo "Starting the paid data service and Aperture…"
 SELLER_PUBKEY="$SELLER_PUBKEY" bun "$ROOT/seller/server.ts" >"$D/logs/service.log" 2>&1 &
@@ -141,9 +145,27 @@ aperture --configfile="$D/aperture.yaml" --basedir="$D/aperture" >"$D/logs/apert
 echo $! >"$D/aperture.pid"
 wait_for Aperture curl -sf http://127.0.0.1:8700/.well-known/l402.json
 
+# litd in remote mode enforces the agent's allowance inside lnd, so it holds even for payments
+# that bypass the MCP server. The agent gets only the account macaroon.
+echo "Starting litd and the agent's spending account…"
+litd --lit-dir="$D/lit" --network=regtest --lnd-mode=remote \
+  --remote.lnd.rpcserver=127.0.0.1:10019 \
+  --remote.lnd.macaroonpath="$D/buyer/data/chain/bitcoin/regtest/admin.macaroon" \
+  --remote.lnd.tlscertpath="$D/buyer/tls.cert" \
+  --httpslisten=127.0.0.1:8443 --disableui \
+  --faraday-mode=disable --loop-mode=disable --pool-mode=disable --taproot-assets-mode=disable \
+  --autopilot.disable >"$D/logs/litd.log" 2>&1 &
+echo $! >"$D/litd.pid"
+litcli() { "$BIN/litcli" --network=regtest --rpcserver=127.0.0.1:8443 --tlscertpath="$D/lit/tls.cert" \
+  --macaroonpath="$D/lit/regtest/lit.macaroon" "$@"; }
+wait_for litd litcli accounts list
+ACCOUNT_ID=$(litcli accounts create "$ACCOUNT_SATS" --expiration_date=$(( $(date +%s) + ACCOUNT_DAYS * 86400 )) \
+  --label=agent --save_to="$D/agent-account.macaroon" | bun -e 'const t = await Bun.stdin.text(); console.log(JSON.parse(t.slice(t.indexOf("{"), t.lastIndexOf("}") + 1)).account.id)')
+
 echo
 echo "Ready."
 echo "  Aperture (L402 proxy):  http://127.0.0.1:8700"
 echo "  Provider node:          $SELLER_PUBKEY"
 echo "  Agent channel balance:  $(buyer channelbalance | bun -e 'console.log((await Bun.stdin.json()).local_balance.sat)') sats"
+echo "  Agent account:          $ACCOUNT_ID, $ACCOUNT_SATS sats, expires in $ACCOUNT_DAYS days"
 echo "  Logs:                   $D/logs"

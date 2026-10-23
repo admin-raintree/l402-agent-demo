@@ -72,10 +72,13 @@ async function discover(origin: string): Promise<Manifest> {
 	return manifest;
 }
 
+// Without a manifest, use the name the ledger recorded for this path so a discovery outage never
+// changes the key a held credential is stored under.
 const serviceFor = (url: URL) =>
 	manifests
 		.get(url.origin)
-		?.services.find((s) => s.resources.some((r) => url.pathname === r.path || url.pathname.startsWith(r.path + "/")))?.name ?? url.pathname;
+		?.services.find((s) => s.resources.some((r) => url.pathname === r.path || url.pathname.startsWith(r.path + "/")))?.name ??
+		store.knownService(url.origin, url.pathname) ?? url.pathname;
 
 async function readBody(res: Response): Promise<unknown> {
 	const reader = res.body?.getReader();
@@ -186,9 +189,9 @@ server.registerTool("l402_preview", {
 		const manifest = discovered.get(url.origin);
 		const service = manifest?.services.find(s => s.resources.some(r => url.pathname === r.path || url.pathname.startsWith(r.path + "/")));
 		const resource = service?.resources.find(r => (url.pathname === r.path || url.pathname.startsWith(r.path + "/")) && (r.method ?? "GET").toUpperCase() === item.method);
-		const serviceName = service?.name ?? url.pathname;
+		const serviceName = service?.name ?? store.knownService(url.origin, url.pathname) ?? url.pathname;
 		const key = `${url.origin} ${serviceName}`;
-		const held = store.serviceCredential(url.origin, serviceName)?.token ?? store.token(key);
+		const held = store.serviceCredential(url.origin, serviceName)?.token ?? store.token(key) ?? store.token(`${url.origin} ${url.pathname}`);
 		const expiry = held ? credentialExpiry(held) : undefined;
 		const reusable = !!held && (expiry === undefined || expiry * 1000 > Date.now());
 		const price = resource?.pricing.model === "fixed" && resource.pricing.price_msat !== undefined
@@ -244,6 +247,8 @@ server.registerTool(
 		if (!manifests.has(url.origin)) await discover(url.origin).catch(() => undefined);
 		const service = serviceFor(url);
 		let key = `${url.origin} ${service}`;
+		// A one-off purchase made while discovery was down is keyed by the pathname instead.
+		const pathKey = `${url.origin} ${url.pathname}`;
 		await reconcile();
 		const call = (authorization?: string) =>
 			fetch(url, { method, body, redirect: "error", headers: authorization ? { authorization } : {}, signal: AbortSignal.timeout(15_000) });
@@ -287,14 +292,20 @@ server.registerTool(
 		if (sub) {
 			const now = new Date();
 			const held = store.serviceCredential(sub.origin, sub.service);
-			if (held) {
-				const validUntil = credentialExpiry(held.token);
-				const heldSub = store.subscription(held.subscriptionId);
-				const reuse = { amount_sat: 0, reused_paid_token: true,
-					payment_hash: store.forKey(periodKey(heldSub, held.period))?.payment_hash, subscription_id: held.subscriptionId, period: held.period,
+			// Try the newest subscription credential, then one bought without a subscription; only when
+			// every held credential has provably lapsed may a renewal pay.
+			const plain = [key, pathKey].find(k => store.token(k));
+			const candidates = [
+				...(held ? [{ token: held.token, payment_hash: store.forKey(periodKey(store.subscription(held.subscriptionId), held.period))?.payment_hash,
+					subscription_id: held.subscriptionId, period: held.period }] : []),
+				...(plain ? [{ token: store.token(plain)!, payment_hash: store.forKey(plain)?.payment_hash, subscription_id: null, period: null }] : []),
+			];
+			for (const { token, ...ids } of candidates) {
+				const validUntil = credentialExpiry(token);
+				const reuse = { amount_sat: 0, reused_paid_token: true, ...ids,
 					valid_until: validUntil ? new Date(validUntil * 1000).toISOString() : null };
 				let res: Response;
-				try { res = await call(held.token); }
+				try { res = await call(token); }
 				catch { return unavailable(reuse); }
 				if (res.status !== 402) return respond(res, reuse);
 				const rejected = assess(undefined, res.status, reuse);
@@ -304,6 +315,9 @@ server.registerTool(
 						reason: "subscription credential rejected before its expiry; automatic repayment blocked" });
 				first = res;
 			}
+			// A payment still in flight may deliver a credential; never pay for the service alongside it.
+			const unresolved = store.pendingFor(url.origin, [service, url.pathname]);
+			if (unresolved) return paymentState(unresolved);
 			const state = subscriptionState(sub, now);
 			if (state !== "active")
 				return json({ status: 402, paid: false, outcome: "refused", subscription_id: sub.id,
@@ -317,9 +331,9 @@ server.registerTool(
 			if (existing) return paymentState(existing);
 			standing = { sub, period };
 		} else {
-			const token = store.token(key);
-			if (token) return deliver(token, { amount_sat: 0, reused_paid_token: true, payment_hash: store.forKey(key)?.payment_hash });
-			const existing = store.forKey(key);
+			const heldKey = [key, pathKey].find(k => store.token(k));
+			if (heldKey) return deliver(store.token(heldKey)!, { amount_sat: 0, reused_paid_token: true, payment_hash: store.forKey(heldKey)?.payment_hash });
+			const existing = store.forKey(key) ?? store.forKey(pathKey);
 			if (existing) return paymentState(existing);
 		}
 

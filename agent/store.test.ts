@@ -241,3 +241,22 @@ test("indexed queries match full scans of the ledger and purchases", () => fixtu
 	expect(store.recentReceipts(2)).toEqual(store.ledger().slice(-2));
 	expect(store.taskSummary("task").receipts).toEqual(store.ledger().filter(r => r.task_id === "task"));
 }));
+
+test("a pathname-keyed purchase blocks repayment under the manifest's service name, and the ledger recalls that name", () => fixture(store => {
+	const other = "33".repeat(32);
+	store.reserve({ ...purchase(), service: "/data", key: "https://provider.test /data" }, 100, policy, now);
+	expect(() => store.reserve({ ...purchase(other), service: "data", key: "https://provider.test data" }, 100, policy, now))
+		.toThrow("automatic repayment blocked");
+	expect(store.knownService("https://provider.test", "/data")).toBeUndefined();
+	store.record({ ...purchase(other), service: "data", outcome: "refused" });
+	expect(store.knownService("https://provider.test", "/data")).toBe("data");
+	expect(store.knownService("https://provider.test", "/other")).toBeUndefined();
+	expect(store.knownService("https://provider.test:8443", "/data")).toBeUndefined();
+	expect(store.pendingFor("https://provider.test", ["data", "/data"])?.payment_hash).toBe(hash);
+}));
+
+test("a settlement without proof that also exceeds the fee limit keeps both reasons", () => fixture(store => {
+	store.reserve(purchase(), 100, policy, now);
+	store.finish(hash, { feeSat: 11 }, now);
+	expect(store.purchase(hash)!.reason).toBe("payment settled without valid L402 proof; automatic repayment blocked; wallet exceeded the authorized fee limit");
+}));

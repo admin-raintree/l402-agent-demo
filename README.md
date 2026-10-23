@@ -163,6 +163,7 @@ All limits include the maximum routing fee. Settled spending is counted on its U
 - At most one renewal is paid per period, and the daily budget still applies.
 - Replacing a paid credential requires its encoded expiry to have passed. An early rejection, or a credential with no readable expiry, cannot trigger automatic repayment.
 - After you cancel, the current credential keeps working until it expires.
+- A credential bought without a subscription is reused too, so subscribing never pays for access already held. No renewal is paid while another payment for the service is unresolved.
 
 On the seller side, set `timeout` (in seconds) and a fixed `price` on the [Aperture](https://github.com/lightninglabs/aperture) service. Aperture v0.5.0 ignores `timeout` for services that use `dynamicprice` or have no `price`, so their credentials never expire. This is [fixed upstream](https://github.com/lightninglabs/aperture/commit/771f371ba5dcd4f11b864b0caa4ae5c233d9cc4a) but not yet released.
 
@@ -175,12 +176,14 @@ On the seller side, set `timeout` (in seconds) and a fixed `price` on the [Apert
 ## Testing
 
 ```sh
-bun test                                  # unit, crash, and concurrency tests
+bun test                                  # unit, crash, concurrency, and model-checking tests
 bun run verify:local                      # real payments, task budgets/previews, and subscriptions
 bun run verify:litd                       # litd account limits
 ```
 
 The test-network checks use fixed ports, so run one at a time.
+
+[docs/statecharts.md](docs/statecharts.md) charts each tool's flow. `bun test models` model-checks credential reuse, settlement, and shared budgets by exploring every interleaving within small bounds.
 
 `verify:local` first runs `scripts/macaroon-scope.ts`: the baked agent macaroon must list exactly the RPCs in `scripts/agent-permissions.txt`, and on a live node both agent credentials must be refused `deletepayments`, `updatechanpolicy`, and `sendcoins`. It also includes `scripts/task-smoke.ts`: it checks previews against independent invoice/payment counts, fee-inclusive task refusals, actual-cost receipts, persistence after restarting MCP, free credential reuse, the shared daily limit, and response quality failures without repayment. Buyer payment proofs and seller invoices are reconciled independently. Verified on local regtest on 2026-10-21: an 80-sat preview settled as 60 sats with zero routing fees, leaving 20 sats in both the task and daily budgets. Preview and credential reuse created no new invoices or payments.
 
@@ -193,6 +196,7 @@ Not tested: mainnet payments, disk or power loss (process crashes are tested), s
 - Separate state directories don't share a budget.
 - With the Wavelength backend there is no wallet-side ceiling; litd accounts cap only the lnd backend.
 - Retrying a POST can run the provider's operation twice.
+- If discovery fails, the service name comes from earlier receipts for the same path, so held credentials are still found. A manifest that renames a service is not tracked. Without a manifest, the payee node is not checked.
 - Provider and discovery responses are limited to 64 KiB. Redirects are rejected; provider requests time out after 15 seconds and discovery after 5 seconds.
 - Invoice destinations are compared with a manifest's advertised node when the wallet exposes a destination. Wavelength's preview does not expose it, so that check is unavailable for this backend. A provider's own manifest is not independent identity verification.
 - Mainnet invoices are refused by their BOLT 11 prefix before the wallet is called, for both backends, unless `L402_ALLOW_MAINNET=1`. The check reads the invoice, not the wallet's network. Mainnet behavior is untested.

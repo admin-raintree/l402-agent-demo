@@ -24,6 +24,11 @@ async function setup() {
 	let lookupStarted = false;
 	let rail = "SEND_RAIL_LIGHTNING";
 	let invoice = "invoice";
+	let manifestDown = false;
+	// Like Aperture, mint a new invoice and preimage for every challenge.
+	let freshInvoices = false;
+	const issued = new Map<string, string>();
+	const intents = new Map<string, string>();
 	let sendStarted: (() => void) | undefined;
 	let releaseSend: (() => void) | undefined;
 	const proof = "11".repeat(32);
@@ -31,19 +36,29 @@ async function setup() {
 	const entries: Record<string, unknown>[] = [];
 	const gateway = Bun.serve({ port: 0, async fetch(req) {
 		const path = new URL(req.url).pathname;
-		if (path === "/.well-known/l402.json") return Response.json({ services: [{ name: "data", resources: [{ path: "/data", pricing: { model: "fixed", price_msat: price * 1000 } }] }] });
+		if (path === "/.well-known/l402.json") return manifestDown ? new Response("unavailable", { status: 503 }) : Response.json({ services: [{ name: "data", resources: [{ path: "/data", pricing: { model: "fixed", price_msat: price * 1000 } }] }] });
 		if (path === "/data") {
 			resourceCalls++;
-			if (req.headers.get("authorization") === `L402 macaroon:${proof}`) {
+			const auth = req.headers.get("authorization");
+			if (auth === `L402 macaroon:${proof}` || [...issued.values()].some(p => auth === `L402 macaroon:${p}`)) {
 				if (failResource) return new Response(null, { status: 302, headers: { location: "http://127.0.0.1:1" } });
 				return new Response(responseBody, { status: responseStatus });
 			}
-			return new Response("pay", { status: 402, headers: { "www-authenticate": `L402 macaroon="macaroon", invoice="${invoice}"` } });
+			const challenge = freshInvoices ? `${invoice}-${issued.size}` : invoice;
+			if (freshInvoices) issued.set(challenge, (issued.size + 1).toString(16).padStart(64, "0"));
+			return new Response("pay", { status: 402, headers: { "www-authenticate": `L402 macaroon="macaroon", invoice="${challenge}"` } });
 		}
-		if (path.endsWith("/prepare-send")) { prepares++; return Response.json({ send_intent_id: "intent", amount_sat: String(price), payment_hash: hash, rail }); }
+		if (path.endsWith("/prepare-send")) {
+			prepares++;
+			const preimage = issued.get((await req.json()).invoice) ?? proof;
+			const paymentHash = createHash("sha256").update(Buffer.from(preimage, "hex")).digest("hex");
+			intents.set(paymentHash, preimage);
+			return Response.json({ send_intent_id: paymentHash, amount_sat: String(price), payment_hash: paymentHash, rail });
+		}
 		if (path.endsWith("/send")) {
 			sends++;
-			entries.push({ id: hash, status: pending ? "ENTRY_STATUS_PENDING" : "ENTRY_STATUS_COMPLETE", fee_sat: "3", progress: { payment_hash: hash, preimage: invalidProof ? "22".repeat(32) : proof } });
+			const id: string = (await req.json()).send_intent_id;
+			entries.push({ id, status: pending ? "ENTRY_STATUS_PENDING" : "ENTRY_STATUS_COMPLETE", fee_sat: "3", progress: { payment_hash: id, preimage: invalidProof ? "22".repeat(32) : intents.get(id) } });
 			sendStarted?.();
 			if (blockSend) await new Promise<void>(resolve => { releaseSend = resolve; });
 			if (dropResponse) return new Response("response lost", { status: 503 });
@@ -82,6 +97,8 @@ async function setup() {
 		set price(v: number) { price = v; }, set responseStatus(v: number) { responseStatus = v; }, set invalidProof(v: boolean) { invalidProof = v; },
 		set dropResponse(v: boolean) { dropResponse = v; }, set blockSend(v: boolean) { blockSend = v; }, set blockLookup(v: boolean) { blockLookup = v; },
 		set pending(v: boolean) { pending = v; }, set rail(v: string) { rail = v; }, set invoice(v: string) { invoice = v; },
+		get manifestDown() { return manifestDown; }, set manifestDown(v: boolean) { manifestDown = v; },
+		set freshInvoices(v: boolean) { freshInvoices = v; },
 		onSend: () => new Promise<void>(resolve => { sendStarted = resolve; }),
 		async close() { releaseSend?.(); for (const c of clients) await c.client.close(); gateway.stop(true); rmSync(dir, { recursive: true, force: true }); } };
 }
@@ -330,6 +347,59 @@ test("mainnet invoices are refused before the wallet sees them unless explicitly
 		expect((await a.call("l402_wallet")).reserved_sat).toBe(0);
 		const allowed = await f.connect("approve", 100, 100, { L402_ALLOW_MAINNET: "1" });
 		expect((await allowed.call()).resource_delivered).toBe(true);
+		expect(f.sends).toBe(1);
+	} finally { await f.close(); }
+});
+
+for (const order of ["manifest-then-outage", "outage-then-manifest"] as const) test(`discovery ${order}: a held credential is reused, never bought again`, async () => {
+	const f = await setup();
+	try {
+		f.freshInvoices = true;
+		f.manifestDown = order === "outage-then-manifest";
+		const a = await f.connect();
+		expect((await a.call()).resource_delivered).toBe(true);
+		await a.client.close();
+		// A new process starts with an empty manifest cache, so it sees the other discovery state.
+		f.manifestDown = !f.manifestDown;
+		const b = await f.connect();
+		const again = await b.call();
+		expect(again.payment.reused_paid_token).toBe(true);
+		expect(again.resource_delivered).toBe(true);
+		expect(f.sends).toBe(1);
+	} finally { await f.close(); }
+});
+
+test("subscribing while holding a one-off credential reuses it instead of paying again", async () => {
+	const f = await setup();
+	try {
+		f.freshInvoices = true;
+		const a = await f.connect();
+		expect((await a.call()).resource_delivered).toBe(true);
+		expect((await a.call("l402_subscribe", { url: f.url, cap_sats_per_period: 100, periods: 2 })).subscribed).toBe(true);
+		const reused = await a.call();
+		expect(reused.payment.reused_paid_token).toBe(true);
+		expect(reused.resource_delivered).toBe(true);
+		const { subscriptions: [sub] } = await a.call("l402_subscriptions", {});
+		await a.call("l402_subscriptions", { cancel: sub.id });
+		// The one-off credential still works after the subscription is cancelled.
+		expect((await a.call()).resource_delivered).toBe(true);
+		expect(f.sends).toBe(1);
+	} finally { await f.close(); }
+});
+
+test("an unresolved one-off payment blocks a subscription renewal until it resolves", async () => {
+	const f = await setup();
+	try {
+		f.freshInvoices = true;
+		f.pending = true; f.dropResponse = true;
+		const a = await f.connect();
+		expect((await a.call()).outcome).toBe("pending");
+		expect((await a.call("l402_subscribe", { url: f.url, cap_sats_per_period: 100, periods: 2 })).subscribed).toBe(true);
+		expect((await a.call()).outcome).toBe("pending");
+		expect(f.sends).toBe(1);
+		// Once the one-off payment settles, its credential serves the subscription too.
+		for (const e of f.entries) e.status = "ENTRY_STATUS_COMPLETE";
+		expect((await a.call()).payment.reused_paid_token).toBe(true);
 		expect(f.sends).toBe(1);
 	} finally { await f.close(); }
 });

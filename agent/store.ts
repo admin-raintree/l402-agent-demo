@@ -76,6 +76,17 @@ export class Store {
 		return (this.db.query("SELECT data FROM purchases WHERE key=?").all(key) as { data: string }[])
 			.map(r => JSON.parse(r.data) as Purchase).find(p => p.outcome !== "failed");
 	}
+	/** Service name a manifest gave this resource earlier, from the ledger, for when discovery is unavailable. */
+	knownService(origin: string, pathname: string): string | undefined {
+		return (this.db.query(`SELECT data FROM receipts WHERE substr(json_extract(data, '$.url'), 1, ?) = ? ORDER BY id DESC`)
+			.all(origin.length + 1, `${origin}/`) as { data: string }[]).map(r => JSON.parse(r.data) as Receipt)
+			.find(r => new URL(r.url).pathname === pathname && r.service !== pathname)?.service;
+	}
+	/** Unresolved payments for a service under any key: one-off, pathname-keyed, or a subscription period. */
+	pendingFor(origin: string, services: string[]): Purchase | undefined {
+		return (this.db.query(`SELECT data FROM purchases WHERE json_extract(data, '$.outcome') = 'pending'`).all() as { data: string }[])
+			.map(r => JSON.parse(r.data) as Purchase).find(p => new URL(p.url).origin === origin && services.includes(p.service));
+	}
 	/** Purchases that still need wallet evidence: pending, or settled without a valid proof. */
 	unresolved(): Purchase[] {
 		return (this.db.query(`SELECT data FROM purchases WHERE json_extract(data, '$.outcome') = 'pending'
@@ -206,8 +217,10 @@ export class Store {
 			// Only paid and pending receipts can block a repayment; legacy imports exist only as receipts.
 			const charged = (this.db.query(`SELECT data FROM receipts WHERE json_extract(data, '$.outcome') IN ('paid', 'pending')`)
 				.all() as { data: string }[]).map(r => JSON.parse(r.data) as Receipt);
-			if (charged.some(r =>
-				(r.payment_hash === p.payment_hash || `${new URL(r.url).origin} ${r.service}` === p.key)))
+			// A one-off purchase made while discovery was down is keyed by its pathname, so match that name too.
+			const names = [p.service, new URL(p.url).pathname];
+			if (charged.some(r => r.payment_hash === p.payment_hash ||
+				(!p.subscription && new URL(r.url).origin === new URL(p.url).origin && names.includes(r.service))))
 				throw new Error("previous payment exists for this service; automatic repayment blocked");
 			const d = decide(p.amount_sat, maxSats, this.spentToday(now), policy, p.fee_limit_sat);
 			if (d.kind === "refuse") throw new Error(d.reason);
@@ -246,7 +259,8 @@ export class Store {
 					delete p.reason;
 					this.db.query("INSERT OR REPLACE INTO tokens VALUES (?, ?)").run(p.key, `L402 ${p.macaroon}:${proof}`);
 				} else p.reason = "payment settled without valid L402 proof; automatic repayment blocked";
-				if (result.feeSat > p.fee_limit_sat) p.reason = "wallet exceeded the authorized fee limit";
+				if (result.feeSat > p.fee_limit_sat)
+					p.reason = [p.reason, "wallet exceeded the authorized fee limit"].filter(Boolean).join("; ");
 			}
 			this.db.query("UPDATE purchases SET data=? WHERE hash=?").run(JSON.stringify(p), hash);
 			this.db.query("UPDATE receipts SET data=? WHERE id=?").run(JSON.stringify(this.receipt(p)), row.receipt_id);

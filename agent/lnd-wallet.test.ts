@@ -79,8 +79,15 @@ test("litd's over-balance refusal is a confirmed payment failure", async () => {
 	expect(e.message).toContain("account balance insufficient");
 });
 
+test("lnd's expired-invoice refusal is a confirmed payment failure", async () => {
+	script({ "payinvoice.err": "[lncli] rpc error: code = Unknown desc = invoice expired. Valid until 2026-11-09 13:33:03 -0800 PST" });
+	expect(await wallet().pay("lnbcrt1", quote, 10).catch(e => e)).toBeInstanceOf(PaymentFailed);
+});
+
 test("litd's expiry error and other lncli errors stay unresolved", async () => {
-	for (const err of ["[lncli] rpc error: code = Unknown desc = account 0123456789abcdef has expired",
+	for (const err of ["[lncli] rpc error: code = Unknown desc = payment failed: invoice expired. Valid until later, reported elsewhere",
+		"invoice expired. Valid until tomorrow",
+		"[lncli] rpc error: code = Unknown desc = account 0123456789abcdef has expired",
 		"[lncli] rpc error: code = Unavailable desc = connection error",
 		// The phrase outside litd's own status, e.g. echoed in other output, is not a refusal.
 		"account balance insufficient",

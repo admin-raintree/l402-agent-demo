@@ -22,6 +22,18 @@ function fixture(run: (store: Store, dir: string) => void) {
 	try { run(store, dir); } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 }
 
+test("processes opening a new ledger at the same moment all succeed", async () => {
+	const script = `import { Store } from ${JSON.stringify(join(import.meta.dir, "store.ts"))}; new Store(process.env.LEDGER_DIR).close();`;
+	for (let round = 0; round < 12; round++) {
+		const dir = mkdtempSync(join(tmpdir(), "l402-open-"));
+		try {
+			const opens = Array.from({ length: 4 }, () => Bun.spawn(["bun", "-e", script], { env: { ...process.env, LEDGER_DIR: dir }, stdout: "ignore", stderr: "pipe" }));
+			const results = await Promise.all(opens.map(async p => ({ code: await p.exited, err: await new Response(p.stderr).text() })));
+			expect(results.filter(r => r.code !== 0).map(r => r.err)).toEqual([]);
+		} finally { rmSync(dir, { recursive: true, force: true }); }
+	}
+}, 60_000);
+
 test("fees count toward every limit and invalid policy values fail closed", () => {
 	expect(decide(95, 100, 0, policy, 10).kind).toBe("refuse");
 	expect(decide(90, 200, 1, policy, 10).kind).toBe("refuse");

@@ -21,7 +21,16 @@ export class Store {
 		const dbPath = join(dir, "payments.sqlite");
 		this.db = new Database(dbPath);
 		chmodSync(dbPath, 0o600);
-		this.db.exec(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+		this.db.exec("PRAGMA busy_timeout=5000;");
+		// SQLite skips the busy handler while switching a new database to WAL, so racing openers need their own wait.
+		for (const deadline = Date.now() + 5000; ;) {
+			try { this.db.exec("PRAGMA journal_mode=WAL;"); break; }
+			catch (e) {
+				if (!String((e as { code?: string }).code).startsWith("SQLITE_BUSY") || Date.now() > deadline) throw e;
+				Bun.sleepSync(10);
+			}
+		}
+		this.db.exec(`PRAGMA synchronous=FULL;
 			CREATE TABLE IF NOT EXISTS receipts (id INTEGER PRIMARY KEY, data TEXT NOT NULL);
 			CREATE TABLE IF NOT EXISTS purchases (hash TEXT PRIMARY KEY, key TEXT NOT NULL, receipt_id INTEGER NOT NULL, data TEXT NOT NULL);
 			CREATE TABLE IF NOT EXISTS tokens (key TEXT PRIMARY KEY, value TEXT NOT NULL);
